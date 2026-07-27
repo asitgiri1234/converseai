@@ -2,8 +2,9 @@
 
 Two things live here:
 
-1. ``TOOLS`` -- the JSON Schema definitions handed to the model in the
-   ``tools`` parameter of a Messages API request.
+1. ``TOOLS`` -- the tool definitions handed to the model, in the OpenAI
+   function-calling format Groq speaks: a list of
+   ``{"type": "function", "function": {"name", "description", "parameters"}}``.
 2. ``dispatch`` -- the client-side executor that runs a tool the model asked
    for and returns a string result.
 
@@ -486,110 +487,101 @@ def run_shell(command: str) -> str:
 # Schemas and dispatch
 # --------------------------------------------------------------------------
 
+def _function(name: str, description: str, properties: dict, required: list[str]):
+    """Wrap a tool in the OpenAI function-calling envelope Groq expects."""
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+            },
+        },
+    }
+
+
 TOOLS: list[dict[str, Any]] = [
-    {
-        "name": "list_files",
-        "description": (
-            "List files and directories recursively as an indented tree. "
-            "Call this to orient yourself in an unfamiliar repository or to "
-            "confirm a path exists before reading or writing it. "
-            "node_modules and .git are never listed."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": (
-                        "Directory to list, relative to the repository root. "
-                        "Defaults to the root itself."
-                    ),
-                }
-            },
-            "required": [],
+    _function(
+        "list_files",
+        "List files and directories recursively as an indented tree. Call "
+        "this to orient yourself in an unfamiliar repository or to confirm a "
+        "path exists before reading or writing it. node_modules and .git are "
+        "never listed.",
+        {
+            "path": {
+                "type": "string",
+                "description": (
+                    "Directory to list, relative to the repository root. "
+                    "Defaults to the root itself."
+                ),
+            }
         },
-    },
-    {
-        "name": "read_file",
-        "description": (
-            "Read a text file and return its contents with line numbers. "
-            "Call this before editing any file so your changes are based on "
-            f"what is actually there. Output is capped at {MAX_READ_LINES} lines."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "File to read, relative to the repository root.",
-                }
-            },
-            "required": ["path"],
+        [],
+    ),
+    _function(
+        "read_file",
+        "Read a text file and return its contents with line numbers. Call "
+        "this before editing any file so your changes are based on what is "
+        f"actually there. Output is capped at {MAX_READ_LINES} lines.",
+        {
+            "path": {
+                "type": "string",
+                "description": "File to read, relative to the repository root.",
+            }
         },
-    },
-    {
-        "name": "search_code",
-        "description": (
-            "Search every text file in the repository with a regular "
-            "expression and return matching 'file:line:text' rows. Call this "
-            "to find where a symbol is defined or used, instead of reading "
-            f"files one by one. Capped at {MAX_SEARCH_RESULTS} results."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "pattern": {
-                    "type": "string",
-                    "description": (
-                        "Python regular expression, matched against each line. "
-                        r"Example: 'def\s+handle_\w+'"
-                    ),
-                }
-            },
-            "required": ["pattern"],
+        ["path"],
+    ),
+    _function(
+        "search_code",
+        "Search every text file in the repository with a regular expression "
+        "and return matching 'file:line:text' rows. Call this to find where a "
+        "symbol is defined or used, instead of reading files one by one. "
+        f"Capped at {MAX_SEARCH_RESULTS} results.",
+        {
+            "pattern": {
+                "type": "string",
+                "description": (
+                    "Python regular expression, matched against each line. "
+                    r"Example: 'exports\.\w+'"
+                ),
+            }
         },
-    },
-    {
-        "name": "write_file",
-        "description": (
-            "Create a file or overwrite it completely, creating parent "
-            "directories as needed. The content you supply replaces the whole "
-            "file, so read it first unless you are creating it."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "File to write, relative to the repository root.",
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Full new contents of the file.",
-                },
+        ["pattern"],
+    ),
+    _function(
+        "write_file",
+        "Create a file or overwrite it completely, creating parent "
+        "directories as needed. The content you supply replaces the whole "
+        "file, so read it first unless you are creating it.",
+        {
+            "path": {
+                "type": "string",
+                "description": "File to write, relative to the repository root.",
             },
-            "required": ["path", "content"],
-        },
-    },
-    {
-        "name": "run_shell",
-        "description": (
-            "Run a shell command with the repository as the working "
-            "directory. Call this to run tests, linters, build steps, or git. "
-            f"Commands are killed after {SHELL_TIMEOUT_SECONDS} seconds, and "
-            "privilege escalation and destructive deletes are refused."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "The command line to run, e.g. 'pytest -q'.",
-                }
+            "content": {
+                "type": "string",
+                "description": "Full new contents of the file.",
             },
-            "required": ["command"],
         },
-    },
+        ["path", "content"],
+    ),
+    _function(
+        "run_shell",
+        "Run a shell command with the repository as the working directory. "
+        "Call this to run tests, linters, build steps, or git. Commands are "
+        f"killed after {SHELL_TIMEOUT_SECONDS} seconds, and privilege "
+        "escalation and destructive deletes are refused.",
+        {
+            "command": {
+                "type": "string",
+                "description": "The command line to run, e.g. 'npm test'.",
+            }
+        },
+        ["command"],
+    ),
 ]
 
 _IMPLEMENTATIONS: dict[str, Callable[..., str]] = {

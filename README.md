@@ -3,13 +3,16 @@
 An AI coding agent for existing Node.js / Express / MongoDB codebases. Give it
 a vague product request; it explores the repo, plans, edits, and verifies.
 
-Python 3.11+. Dependencies: `anthropic`, `python-dotenv`.
+Runs on **Groq**. Python 3.11+. Dependencies: `groq`, `python-dotenv`.
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env          # add ANTHROPIC_API_KEY
-python main.py --repo ./target-repo --task "Improve the application so users can better organise and search their notes."
+cp .env.example .env          # add GROQ_API_KEY
+python main.py --repo ./target-repo --task "Add a GET /notes/count endpoint."
 ```
+
+Defaults to `llama-3.3-70b-versatile`; `--model openai/gpt-oss-120b` and
+`qwen/qwen3.6-27b` also drive the tool loop correctly.
 
 ## Architecture
 
@@ -26,9 +29,9 @@ on every request.
      │                                                     │
      ├──▶ agent/prompts.py    system prompt (phases, rules)│
      │                                                     │
-     ├──▶ agent/llm.py ──────▶ Anthropic Messages API      │
-     │      one request         (streamed, one Message back)│
-     │    ◀── content: [thinking, text, tool_use …]        │
+     ├──▶ agent/llm.py ──────▶ Groq chat completions       │
+     │      one request         (OpenAI-compatible)         │
+     │    ◀── message.content + message.tool_calls          │
      │                                                     │
      └──▶ agent/tools.py ──▶ target repo (filesystem, shell)
             dispatch(name, input) → str ────────────────────┘
@@ -37,9 +40,10 @@ on every request.
 
 - **`main.py`** — CLI surface. Validates `--repo`, binds it as the tool root,
   maps exceptions to exit codes (2 = bad input, 1 = run failed, 130 = Ctrl-C).
-- **`agent/llm.py`** — thin Messages API wrapper. One call, one `Message`
-  returned unmodified. Streams internally so long turns don't hit the HTTP
-  timeout. Defaults to `claude-opus-5` with adaptive thinking.
+- **`agent/llm.py`** — thin chat-completions wrapper. One call, one
+  `ChatCompletion` returned unmodified. Tools go out in OpenAI function
+  format; calls come back on `message.tool_calls` with arguments as a JSON
+  *string*, so the loop parses (and validates) them.
 - **`agent/prompts.py`** — the stable system prompt. Kept free of
   interpolation so it stays a cacheable prefix; run-specific context (repo
   path, task) goes in the first user message.
@@ -115,16 +119,41 @@ passes runs with your full privileges. Use a throwaway checkout.
   It would become worth it somewhere in the thousands-of-files range.
 - **Read-before-write is instructed, not enforced.** The prompt requires it;
   nothing in the harness blocks a `write_file` on an unread path.
+- **History is elided, not summarised.** Tool results older than the last four
+  are replaced with a placeholder in the *request* (the real history is kept),
+  which is cheap and lossless-by-reference — the agent can re-read — but it
+  does cause repeat reads. Real compaction would summarise instead.
 - **Git is untouched.** No branch, no commit, no rollback. Review with
   `git diff` in the target repo and revert by hand.
 
+## What a real run looks like
+
+Verified end to end against `callicoder/node-easy-notes-app` on
+`openai/gpt-oss-120b`: 20 turns, 18 tool calls, ~9 minutes, 82k prompt / 4.6k
+completion tokens, finishing with a `SUMMARY:`. All five phases fired, and the
+model got the non-obvious part right — it registered `/notes/count` *before*
+`/notes/:noteId` so Express wouldn't shadow it, and `node --check` passed on
+both edited files.
+
+The diff was still poor: it reformatted the entire controller (`if(` → `if (`,
+promise-chain reindentation) alongside the 12 lines the feature needed — 84
+insertions and 63 deletions for a small change. Whole-file writes let a model
+"tidy" everything it retypes, and these models do.
+
 ## Limitations
 
-- **Not yet run against a live model.** The loop, tools, and prompt were
-  verified with scripted responses and by running the tools against the cloned
-  `target-repo` — but no end-to-end run has happened, because this environment
-  has no `ANTHROPIC_API_KEY`. Real-model adherence to the phase structure is
-  unproven.
+- **Model quality dominates.** On the vaguer task ("better organise and search
+  their notes"), `llama-3.3-70b-versatile` re-emitted its `PLAN:` six times
+  without progressing, burning most of a daily token budget before it started
+  editing. The phase prompt is followed loosely, not reliably.
+- **Free-tier token limits are the real ceiling.** Groq bills
+  `max_completion_tokens` against the per-minute budget *up front*, so
+  `prompt + max_completion_tokens` must fit under the TPM limit — 8k on most
+  models, 12k on `llama-3.3-70b-versatile`. Too high and requests 413; too low
+  and `write_file`'s whole-file argument truncates mid-JSON and Groq rejects
+  the call. The default (1800) threads that gap for a ~120-line file, and the
+  loop elides older tool results from each request to keep history small. A
+  larger repo will need a paid tier.
 - `node-easy-notes-app` defines `"test": "echo \"Error: no test specified\" &&
   exit 1"`. VERIFY's `npm test` step will *always* fail there, and the agent
   may waste turns trying to fix it. `node --check` is the meaningful signal.

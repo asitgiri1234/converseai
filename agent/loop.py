@@ -1,13 +1,13 @@
 """The agent loop: model turn -> tool calls -> results -> repeat.
 
-The Messages API is stateless, so this module owns the conversation history:
-it appends each assistant response and each batch of tool results, then calls
-the model again until the model answers with text instead of asking for tools.
+The chat completions API is stateless, so this module owns the conversation
+history: it appends each assistant reply and each tool result, then calls the
+model again until the model answers with text instead of asking for tools.
 
-Two rules that are easy to get wrong and are load-bearing here: append the
-*whole* ``response.content`` (not just the text) so ``tool_use`` and thinking
-blocks survive the round trip, and return every tool result in a single user
-message so parallel tool calls keep working.
+Two rules that are easy to get wrong and are load-bearing here: the assistant
+message must be appended *with its ``tool_calls``* intact, and every tool call
+needs exactly one ``role: "tool"`` reply carrying the matching
+``tool_call_id`` -- Groq rejects the next request otherwise.
 
 Everything the loop does is narrated to stdout -- turn number, tool name,
 truncated input, one-line result preview -- so a run is readable as it happens.
@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-import anthropic
+import groq
 
 from agent.llm import LLM
 from agent.prompts import SUMMARY_MARKER, build_system_prompt, build_task_message
@@ -31,9 +31,12 @@ from agent.tools import TOOLS, dispatch, set_repo_root
 # asking for tools, so a confused run can't spin forever.
 MAX_TURNS = 40
 
-# One retry on a transient API failure, on top of the SDK's own retries.
-RETRY_ATTEMPTS = 2
+# Retries on transient API failures, on top of the SDK's own. Groq's free
+# tier is metered per minute and an agent replays its whole history every
+# turn, so rate limits are routine rather than exceptional here.
+RETRY_ATTEMPTS = 3
 RETRY_BASE_DELAY = 2.0
+MAX_RETRY_DELAY = 65.0
 
 MAX_INPUT_PREVIEW = 160
 MAX_RESULT_PREVIEW = 110
@@ -45,6 +48,14 @@ MAX_TEXT_LINES = 16
 # turn ends the run only once it carries the summary marker; before that the
 # agent gets nudged back to work, at most this many times so a model that
 # never emits the marker still terminates.
+# File contents dominate an agent's history: one 120-line file read twice is
+# most of a small tier's per-minute budget. Older tool results are elided from
+# the *request* (history itself is kept intact) so a long run stays under the
+# limit. The elision is worded so the model knows it can re-read.
+KEEP_TOOL_RESULTS = 4
+ELIDE_OVER_CHARS = 400
+ELIDED = "[earlier result elided to save context -- re-read the file if you still need it]"
+
 MAX_NUDGES = 3
 NUDGE = (
     "That was not a summary, so the task is not finished. Continue with the "
@@ -154,7 +165,7 @@ def run(
     Raises:
         RuntimeError: If ``max_turns`` is reached with the agent still
             requesting tools.
-        anthropic.APIError: If a request fails and the retry also fails.
+        groq.APIError: If a request fails and the retry also fails.
     """
     set_repo_root(repo)
     llm = llm or LLM()
@@ -164,7 +175,7 @@ def run(
     ]
 
     _say(_rule())
-    _say(f"  converseai  {_ARROW}  {llm.model}  (effort={llm.effort})")
+    _say(f"  converseai  {_ARROW}  groq / {llm.model}  (temp={llm.temperature})")
     _say(f"  repo: {repo}")
     _say(f"  task: {_clip(_flatten(task), 60)}")
     _say(_rule())
@@ -180,30 +191,29 @@ def run(
         _say(f"\n[turn {turn}/{max_turns}]")
         response = _complete_with_retry(llm, messages, system)
 
-        tokens_in += response.usage.input_tokens
-        tokens_out += response.usage.output_tokens
+        choice = response.choices[0]
+        message = choice.message
+        if response.usage:
+            tokens_in += response.usage.prompt_tokens
+            tokens_out += response.usage.completion_tokens
 
-        _log_thinking(response)
+        _log_reasoning(message)
 
-        # Append the whole content: dropping tool_use or thinking blocks here
-        # makes the next request invalid.
-        messages.append({"role": "assistant", "content": response.content})
+        # The assistant turn must go back with its tool_calls attached, or the
+        # role="tool" replies below have nothing to answer.
+        messages.append(_assistant_message(message))
 
-        if response.stop_reason == "refusal":
-            _say(f"  {_BAD} the model declined this request")
-            _log_footer(time.monotonic() - started, turn, tool_calls, tokens_in, tokens_out)
-            return "The model declined to complete this task."
+        if choice.finish_reason == "length":
+            _say(f"  {_BAD} response hit the token limit and may be cut short")
 
-        if response.stop_reason != "tool_use":
-            if response.stop_reason == "max_tokens":
-                _say(f"  {_BAD} response hit max_tokens and may be cut short")
-            final = _final_text(response)
+        if not message.tool_calls:
+            final = (message.content or "").strip()
 
             # A phase like PLAN ends a turn with text and no tool call. That
             # is mid-run, not done, so only the summary marker stops the loop.
             if SUMMARY_MARKER not in final and nudges < MAX_NUDGES:
                 nudges += 1
-                _log_text(response)
+                _log_text(final)
                 _say(f"  {_CALL} no {SUMMARY_MARKER} yet -- continuing")
                 messages.append({"role": "user", "content": NUDGE})
                 continue
@@ -212,10 +222,10 @@ def run(
             _log_footer(time.monotonic() - started, turn, tool_calls, tokens_in, tokens_out)
             return final
 
-        _log_text(response)
-        results = _handle_tool_use(response)
+        _log_text((message.content or "").strip())
+        results = _handle_tool_calls(message)
         tool_calls += len(results)
-        messages.append({"role": "user", "content": results})
+        messages.extend(results)
 
     _say("")
     _say(_rule())
@@ -229,7 +239,7 @@ def run(
 
 def _complete_with_retry(
     llm: LLM, messages: list[dict[str, Any]], system: str
-) -> anthropic.types.Message:
+) -> Any:
     """Call the model, retrying once on a transient failure.
 
     The SDK already retries 429s and 5xxs internally; this is the outer layer
@@ -242,91 +252,198 @@ def _complete_with_retry(
         system: System prompt.
 
     Returns:
-        The ``Message`` returned by the API.
+        The ``ChatCompletion`` returned by the API.
 
     Raises:
-        anthropic.APIError: If the final attempt fails.
+        groq.APIError: If the final attempt fails.
     """
+    payload = _elide_old_results(messages)
+
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
-            return llm.complete(messages=messages, tools=TOOLS, system=system)
+            return llm.complete(messages=payload, tools=TOOLS, system=system)
         except (
-            anthropic.APIConnectionError,
-            anthropic.RateLimitError,
-            anthropic.InternalServerError,
+            groq.APIConnectionError,
+            groq.RateLimitError,
+            groq.InternalServerError,
         ) as exc:
             if attempt == RETRY_ATTEMPTS:
                 _say(f"  {_BAD} API error, retries exhausted: {exc}")
                 raise
-            delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+            delay = _retry_delay(exc, attempt)
             _say(f"  {_BAD} API error ({type(exc).__name__}); retrying in {delay:g}s")
             time.sleep(delay)
-        except anthropic.APIStatusError as exc:
+        except groq.BadRequestError as exc:
+            # `tool_use_failed` means the model's own tool-call JSON was
+            # malformed or truncated -- a generation artifact, not a bad
+            # request from us, so it is worth another sample.
+            if "tool_use_failed" not in str(exc) or attempt == RETRY_ATTEMPTS:
+                _say(f"  {_BAD} API error {exc.status_code}: {exc.message}")
+                raise
+            _say(f"  {_BAD} model emitted malformed tool-call JSON; resampling")
+            time.sleep(RETRY_BASE_DELAY)
+        except groq.APIStatusError as exc:
             _say(f"  {_BAD} API error {exc.status_code}: {exc.message}")
             raise
 
     raise AssertionError("unreachable")  # pragma: no cover
 
 
-def _handle_tool_use(response: Any) -> list[dict[str, Any]]:
-    """Execute every ``tool_use`` block in a response, narrating as it goes.
+def _elide_old_results(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return a copy of ``messages`` with stale tool results shortened.
+
+    Only the *content* is replaced, never the message itself: every
+    ``role: "tool"`` entry has to keep its ``tool_call_id`` so it still
+    answers the assistant call that requested it, or the request is rejected.
+
+    Args:
+        messages: The live history. Not mutated.
+
+    Returns:
+        A shallow copy safe to send as the request payload.
+    """
+    tool_positions = [
+        i for i, entry in enumerate(messages) if entry.get("role") == "tool"
+    ]
+    recent = set(tool_positions[-KEEP_TOOL_RESULTS:])
+
+    trimmed: list[dict[str, Any]] = []
+    for i, entry in enumerate(messages):
+        stale = (
+            entry.get("role") == "tool"
+            and i not in recent
+            and len(entry.get("content") or "") > ELIDE_OVER_CHARS
+        )
+        trimmed.append({**entry, "content": ELIDED} if stale else entry)
+    return trimmed
+
+
+def _retry_delay(exc: Exception, attempt: int) -> float:
+    """How long to wait before retrying ``exc``.
+
+    A rate-limited response says exactly when the budget frees up, and that
+    beats guessing: exponential backoff from 2s would retry long before a
+    per-minute window has rolled over. Falls back to exponential backoff when
+    the header is absent or unparseable.
+
+    Args:
+        exc: The exception that triggered the retry.
+        attempt: 1-based attempt number that just failed.
+
+    Returns:
+        Seconds to sleep, capped at ``MAX_RETRY_DELAY``.
+    """
+    response = getattr(exc, "response", None)
+    header = getattr(response, "headers", {}).get("retry-after") if response else None
+    if header:
+        try:
+            # A small margin, since the window rolls over slightly after the
+            # server's own estimate.
+            return min(float(header) + 1.0, MAX_RETRY_DELAY)
+        except ValueError:
+            pass
+    return min(RETRY_BASE_DELAY * (2 ** (attempt - 1)), MAX_RETRY_DELAY)
+
+
+def _assistant_message(message: Any) -> dict[str, Any]:
+    """Convert an assistant reply back into a plain history entry.
+
+    Rebuilt field by field rather than dumping the SDK model, so nothing
+    provider-specific (``reasoning``, ``refusal``, null ``function_call``)
+    leaks back into the next request.
+
+    Args:
+        message: ``response.choices[0].message``.
+
+    Returns:
+        A ``role: "assistant"`` message, carrying ``tool_calls`` when present.
+    """
+    entry: dict[str, Any] = {"role": "assistant", "content": message.content or ""}
+    if message.tool_calls:
+        entry["tool_calls"] = [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.function.name,
+                    "arguments": call.function.arguments,
+                },
+            }
+            for call in message.tool_calls
+        ]
+    return entry
+
+
+def _handle_tool_calls(message: Any) -> list[dict[str, Any]]:
+    """Execute every tool call on an assistant message, narrating as it goes.
 
     Tools are already bound to the repo root by `agent.tools.set_repo_root`,
     so nothing is passed through here.
 
     Args:
-        response: The ``Message`` returned by `agent.llm.LLM.complete`.
+        message: ``response.choices[0].message``, with ``tool_calls`` set.
 
     Returns:
-        One ``tool_result`` block per ``tool_use`` block, in the same order,
-        each carrying the matching ``tool_use_id``. The API rejects the next
-        request if any ``tool_use`` id is left without a result, so failures
-        are reported as results with ``is_error: true`` rather than skipped.
+        One ``role: "tool"`` message per call, in order, each carrying the
+        matching ``tool_call_id``. Groq rejects the next request if any call
+        is left unanswered, so failures -- including arguments that are not
+        valid JSON -- come back as results rather than being skipped.
     """
     results: list[dict[str, Any]] = []
 
-    for block in response.content:
-        if block.type != "tool_use":
+    for call in message.tool_calls:
+        name = call.function.name
+        raw_args = call.function.arguments or "{}"
+
+        # Arguments arrive as a JSON string the model generated, so they can
+        # be malformed. Report that back instead of crashing the run.
+        try:
+            arguments = json.loads(raw_args)
+        except json.JSONDecodeError as exc:
+            _say(f"  {_CALL} {name}({_clip(_flatten(raw_args), 80)})")
+            _say(f"    {_BAD} arguments were not valid JSON: {exc}")
+            results.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": (
+                        f"Error: arguments for {name} were not valid JSON "
+                        f"({exc}). Re-issue the call with a valid JSON object."
+                    ),
+                }
+            )
             continue
 
-        _say(f"  {_CALL} {block.name}({_format_input(block.input)})")
+        _say(f"  {_CALL} {name}({_format_input(arguments)})")
 
         started = time.monotonic()
-        result = dispatch(block.name, block.input)
+        result = dispatch(name, arguments)
         elapsed = time.monotonic() - started
 
-        failed = result.startswith("Error:")
-        marker = _BAD if failed else _OK
+        marker = _BAD if result.startswith("Error:") else _OK
         timing = f"  ({elapsed:.1f}s)" if elapsed >= 0.5 else ""
         _say(f"    {marker} {_format_result(result)}{timing}")
 
         results.append(
-            {
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": result,
-                "is_error": failed,
-            }
+            {"role": "tool", "tool_call_id": call.id, "content": result}
         )
 
     return results
 
 
-def _log_thinking(response: Any) -> None:
-    """Print a one-line preview of the model's summarized thinking, if any."""
-    for block in response.content:
-        if block.type == "thinking" and getattr(block, "thinking", ""):
-            _say(f"  {_clip(_flatten(block.thinking), 100)}")
-            return
+def _log_reasoning(message: Any) -> None:
+    """Print a one-line preview of the model's reasoning, when it exposes it."""
+    reasoning = getattr(message, "reasoning", None)
+    if reasoning:
+        _say(f"  {_clip(_flatten(reasoning), 100)}")
 
 
-def _log_text(response: Any) -> None:
+def _log_text(text: str) -> None:
     """Print assistant text, keeping its line structure.
 
     The PLAN phase is a numbered list, so flattening it to one line would make
     the most informative moment of a run the least readable one.
     """
-    text = _final_text(response)
     if not text:
         return
 
@@ -362,17 +479,3 @@ def _log_footer(
 def _plural(count: int, noun: str) -> str:
     """Format ``count`` with ``noun``, pluralised with a trailing s."""
     return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
-
-
-def _final_text(response: Any) -> str:
-    """Join the text blocks of a response into a single string.
-
-    Args:
-        response: The ``Message`` returned by `agent.llm.LLM.complete`.
-
-    Returns:
-        The concatenated text, ignoring thinking and tool_use blocks.
-    """
-    return "\n".join(
-        block.text for block in response.content if block.type == "text"
-    ).strip()

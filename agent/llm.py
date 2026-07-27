@@ -1,8 +1,12 @@
-"""Thin wrapper around the Anthropic Messages API with tool-use support.
+"""Thin wrapper around the Groq chat completions API with tool-use support.
 
 This module is deliberately small: it owns client construction, model defaults,
 and the single request/response call. It does *not* own the agent loop or tool
 execution -- those live in `agent.loop` and `agent.tools`.
+
+Groq speaks the OpenAI chat-completions dialect, so tools go out as a list of
+``{"type": "function", "function": {...}}`` objects and come back on
+``message.tool_calls`` with their arguments as a JSON *string*.
 
 Usage:
 
@@ -11,11 +15,12 @@ Usage:
     llm = LLM()
     response = llm.complete(
         messages=[{"role": "user", "content": "List the files in this repo."}],
-        tools=[{"name": "list_files", "description": "...", "input_schema": {...}}],
+        tools=TOOLS,
         system="You are a coding agent.",
     )
-    if response.stop_reason == "tool_use":
-        ...  # dispatch the tool_use blocks, then call complete() again
+    message = response.choices[0].message
+    if message.tool_calls:
+        ...  # run each call, append role="tool" results, call complete() again
 """
 
 from __future__ import annotations
@@ -23,32 +28,43 @@ from __future__ import annotations
 import os
 from typing import Any, Iterable
 
-import anthropic
+import groq
 from dotenv import load_dotenv
 
 load_dotenv()
 
-DEFAULT_MODEL = "claude-opus-5"
-DEFAULT_MAX_TOKENS = 16_000
-DEFAULT_EFFORT = "high"
+# Handles the tool loop correctly and carries the most generous free-tier
+# token budget (12k TPM vs 8k for the gpt-oss and qwen models), which matters
+# because an agent replays its whole history every turn. Override with
+# --model or the GROQ_MODEL env var.
+DEFAULT_MODEL = "llama-3.3-70b-versatile"
+
+# Squeezed from both sides. Groq bills this against the per-minute token
+# budget *up front*, on top of the prompt, so `prompt + max_completion_tokens`
+# must fit under the TPM limit or the request 413s before the model ever runs.
+# But write_file sends a whole file as a tool argument, and a budget that
+# cannot fit the largest file truncates the arguments mid-JSON, which Groq
+# rejects with `tool_use_failed`. This value clears a ~120-line file while
+# leaving room for history on a 12k TPM tier.
+DEFAULT_MAX_TOKENS = 1_800
+DEFAULT_TEMPERATURE = 0.2
 
 
 class MissingAPIKeyError(RuntimeError):
-    """Raised when ANTHROPIC_API_KEY is not set in the environment."""
+    """Raised when GROQ_API_KEY is not set in the environment."""
 
 
 class LLM:
-    """A single-call wrapper around `client.messages.create`.
+    """A single-call wrapper around ``client.chat.completions.create``.
 
     Args:
-        model: Model id to use. Defaults to the ``ANTHROPIC_MODEL`` env var,
-            falling back to ``claude-opus-5``.
-        max_tokens: Ceiling on tokens generated per response (thinking tokens
-            count against this too).
-        effort: One of ``low``, ``medium``, ``high``, ``xhigh``, ``max``.
-            Controls how much the model thinks and how thoroughly it works.
-        api_key: Overrides the ``ANTHROPIC_API_KEY`` env var. Prefer the env
-            var; this exists for tests and for callers that manage their own
+        model: Model id to use. Defaults to the ``GROQ_MODEL`` env var,
+            falling back to ``openai/gpt-oss-120b``.
+        max_tokens: Ceiling on tokens generated per response.
+        temperature: Sampling temperature. Low by default -- this is a coding
+            agent, not a brainstorming one.
+        api_key: Overrides the ``GROQ_API_KEY`` env var. Prefer the env var;
+            this exists for tests and for callers that manage their own
             secrets.
     """
 
@@ -56,20 +72,20 @@ class LLM:
         self,
         model: str | None = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
-        effort: str = DEFAULT_EFFORT,
+        temperature: float = DEFAULT_TEMPERATURE,
         api_key: str | None = None,
     ) -> None:
-        key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+        key = api_key or os.environ.get("GROQ_API_KEY")
         if not key:
             raise MissingAPIKeyError(
-                "ANTHROPIC_API_KEY is not set. Copy .env.example to .env and "
+                "GROQ_API_KEY is not set. Copy .env.example to .env and "
                 "add your key, or export it in your shell."
             )
 
-        self.model = model or os.environ.get("ANTHROPIC_MODEL") or DEFAULT_MODEL
+        self.model = model or os.environ.get("GROQ_MODEL") or DEFAULT_MODEL
         self.max_tokens = max_tokens
-        self.effort = effort
-        self.client = anthropic.Anthropic(api_key=key)
+        self.temperature = temperature
+        self.client = groq.Groq(api_key=key)
 
     def complete(
         self,
@@ -77,44 +93,45 @@ class LLM:
         tools: Iterable[dict[str, Any]] | None = None,
         system: str | None = None,
         max_tokens: int | None = None,
-        effort: str | None = None,
-    ) -> anthropic.types.Message:
-        """Send one turn to the model and return the raw ``Message``.
+        temperature: float | None = None,
+    ) -> Any:
+        """Send one turn to the model and return the raw completion.
 
         The response is returned unmodified so the caller can inspect
-        ``stop_reason`` (``end_turn`` vs ``tool_use``) and walk ``content``
-        blocks itself. Nothing here executes tools or mutates ``messages``.
+        ``choices[0].message.tool_calls`` and ``finish_reason`` itself.
+        Nothing here executes tools or mutates ``messages``.
 
         Args:
-            messages: Full conversation history, oldest first. The API is
-                stateless, so this must include every prior turn.
-            tools: Tool definitions the model may call this turn. Omit or pass
-                an empty list to disable tool use.
+            messages: Conversation history, oldest first, *without* the system
+                message -- it is prepended here so it stays out of the mutable
+                history and can't be truncated away.
+            tools: Tool definitions in OpenAI function format. Omit or pass an
+                empty list to disable tool use.
             system: System prompt. See `agent.prompts`.
             max_tokens: Per-call override of the instance default.
-            effort: Per-call override of the instance default.
+            temperature: Per-call override of the instance default.
 
         Returns:
-            The ``Message`` object, including any ``tool_use`` content blocks.
+            The ``ChatCompletion`` object.
 
         Raises:
-            anthropic.APIStatusError: For non-2xx responses (rate limits,
-                invalid requests, server errors). The SDK already retries
-                429s and 5xxs with backoff.
+            groq.APIStatusError: For non-2xx responses (rate limits, invalid
+                requests, server errors).
         """
+        payload: list[dict[str, Any]] = []
+        if system:
+            payload.append({"role": "system", "content": system})
+        payload.extend(messages)
+
         request: dict[str, Any] = {
             "model": self.model,
-            "max_tokens": max_tokens or self.max_tokens,
-            "messages": messages,
-            "output_config": {"effort": effort or self.effort},
-            "thinking": {"type": "adaptive", "display": "summarized"},
+            "messages": payload,
+            "max_completion_tokens": max_tokens or self.max_tokens,
+            "temperature": (
+                self.temperature if temperature is None else temperature
+            ),
         }
-        if system:
-            request["system"] = system
         if tools:
             request["tools"] = list(tools)
 
-        # Stream and collect: keeps long tool-heavy turns from tripping the
-        # SDK's HTTP timeout, while still handing back one complete Message.
-        with self.client.messages.stream(**request) as stream:
-            return stream.get_final_message()
+        return self.client.chat.completions.create(**request)

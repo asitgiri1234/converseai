@@ -114,7 +114,7 @@ def build_system_prompt(extra_instructions: str | None = None) -> str:
 
     Args:
         extra_instructions: Project-specific rules to append (e.g. the
-            contents of a CLAUDE.md found in the repo). Appended after the
+            contents of an AGENTS.md found in the repo). Appended after the
             stable prompt so the cached prefix is unaffected.
 
     Returns:

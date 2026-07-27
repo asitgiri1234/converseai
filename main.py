@@ -9,9 +9,14 @@ import argparse
 import sys
 from pathlib import Path
 
-import anthropic
+import groq
 
-from agent.llm import LLM, MissingAPIKeyError
+from agent.llm import (
+    DEFAULT_MODEL,
+    DEFAULT_TEMPERATURE,
+    LLM,
+    MissingAPIKeyError,
+)
 from agent.loop import MAX_TURNS, run
 from agent.tools import set_repo_root
 
@@ -36,13 +41,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--model",
         default=None,
-        help="Model id to use. Defaults to $ANTHROPIC_MODEL, then claude-opus-5.",
+        help=f"Groq model id. Defaults to $GROQ_MODEL, then {DEFAULT_MODEL}.",
     )
     parser.add_argument(
-        "--effort",
-        default="high",
-        choices=["low", "medium", "high", "xhigh", "max"],
-        help="How hard the model works per turn. Default: high.",
+        "--temperature",
+        type=float,
+        default=DEFAULT_TEMPERATURE,
+        help=f"Sampling temperature. Default: {DEFAULT_TEMPERATURE}.",
     )
     parser.add_argument(
         "--max-turns",
@@ -66,7 +71,7 @@ def main(argv: list[str] | None = None) -> int:
     set_repo_root(repo)
 
     try:
-        llm = LLM(model=args.model, effort=args.effort)
+        llm = LLM(model=args.model, temperature=args.temperature)
     except MissingAPIKeyError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -77,8 +82,8 @@ def main(argv: list[str] | None = None) -> int:
         # The loop already printed the detail; this is just the exit code.
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    except anthropic.APIError as exc:
-        print(f"error: Anthropic API request failed: {exc}", file=sys.stderr)
+    except groq.APIError as exc:
+        print(f"error: Groq API request failed: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
