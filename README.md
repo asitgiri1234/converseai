@@ -7,9 +7,42 @@ Python 3.11+. Dependencies: `anthropic`, `python-dotenv`.
 
 ## Status
 
-Scaffolding. `agent/llm.py`, `agent/tools.py`, and the CLI are working; the
-agent loop (`agent/loop.py`) and the prompts (`agent/prompts.py`) are stubs
-with docstrings describing what each piece needs to do.
+Working end to end. Point it at a repo, give it a task, and it explores,
+edits, and verifies until it's done.
+
+```
+────────────────────────────────────────────────────────────────────────
+  converseai  →  claude-opus-5  (effort=high)
+  repo: /home/me/demo
+  task: Add a health check endpoint
+────────────────────────────────────────────────────────────────────────
+
+[turn 1/40]
+  I should look at the repo layout before editing anything.
+  · list_files(path=".")
+    ✓ ./  [12 lines]
+  · read_file(path="src/app.py")
+    ✓ 1 from flask import Flask  [34 lines]
+
+[turn 2/40]
+  · write_file(path="src/health.py", content="def health(): return {'stat…")
+    ✓ Created src/health.py (4 lines, 61 bytes).
+  · run_shell(command="pytest -q")
+    ✓ exit code: 0  [3 lines]  (2.4s)
+
+────────────────────────────────────────────────────────────────────────
+  ✓ done
+────────────────────────────────────────────────────────────────────────
+Added src/health.py with a health() endpoint. Tests pass.
+────────────────────────────────────────────────────────────────────────
+  2 turns  ·  4 tool calls  ·  31s  ·  18,204 in / 1,960 out tokens
+────────────────────────────────────────────────────────────────────────
+```
+
+The loop stops when the model replies with text instead of tool calls, and
+hard-stops at 40 turns (`--max-turns`). Transient API failures get one retry
+with exponential backoff; 4xx errors fail immediately. Box-drawing glyphs fall
+back to ASCII when the terminal can't encode them.
 
 ## Tools
 
@@ -68,11 +101,11 @@ Options: `--model` (default `claude-opus-5`, overridable via `$ANTHROPIC_MODEL`)
 | --- | --- |
 | `main.py` | CLI: argument parsing, validation, exit codes |
 | `agent/llm.py` | Thin Messages API wrapper — one request, one `Message` back |
-| `agent/loop.py` | The agent loop: model turn → tool calls → results → repeat |
+| `agent/loop.py` | The agent loop, retry policy, and console output |
 | `agent/tools.py` | Tool schemas and client-side dispatch |
 | `agent/prompts.py` | System prompt and prompt assembly |
 
-## Notes for whoever fills in the stubs
+## Implementation notes
 
 - **Append the whole `response.content`** to the message history, not just the
   text. Dropping `tool_use` blocks breaks the next request.

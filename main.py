@@ -9,8 +9,10 @@ import argparse
 import sys
 from pathlib import Path
 
+import anthropic
+
 from agent.llm import LLM, MissingAPIKeyError
-from agent.loop import run
+from agent.loop import MAX_TURNS, run
 from agent.tools import set_repo_root
 
 
@@ -45,8 +47,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-turns",
         type=int,
-        default=50,
-        help="Stop after this many model turns. Default: 50.",
+        default=MAX_TURNS,
+        help=f"Stop after this many model turns. Default: {MAX_TURNS}.",
     )
     return parser.parse_args(argv)
 
@@ -70,19 +72,18 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        result = run(repo, args.task, llm=llm, max_turns=args.max_turns)
-    except NotImplementedError:
-        print(
-            "error: the agent loop is not implemented yet "
-            "(see agent/loop.py and agent/tools.py).",
-            file=sys.stderr,
-        )
+        run(repo, args.task, llm=llm, max_turns=args.max_turns)
+    except RuntimeError as exc:
+        # The loop already printed the detail; this is just the exit code.
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except anthropic.APIError as exc:
+        print(f"error: Anthropic API request failed: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
         return 130
 
-    print(result)
     return 0
 
 
