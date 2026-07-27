@@ -1,31 +1,137 @@
 # converseai
 
-An AI coding agent for existing Node.js / Express / MongoDB codebases. Give it
-a vague product request; it explores the repo, plans, edits, and verifies.
+An AI coding agent for existing **Node.js / Express / MongoDB** codebases,
+running on **Groq**. Give it a vague product request — *"let users organise
+their notes better"* — and it explores the repository, writes a plan, makes the
+edits, verifies them, and reports what it changed.
 
-Runs on **Groq**. Python 3.11+. Dependencies: `groq`, `python-dotenv`.
+It is a single-file-per-concern, dependency-light implementation: five Python
+modules, two third-party packages, no framework. Everything the agent does is
+narrated to the terminal as it happens.
+
+---
+
+## Contents
+
+- [Quick start](#quick-start)
+- [CLI reference](#cli-reference)
+- [Configuration](#configuration)
+- [Architecture](#architecture)
+- [The agent workflow](#the-agent-workflow)
+- [How repository exploration works](#how-repository-exploration-works)
+- [Tool reference](#tool-reference)
+- [Safety model](#safety-model)
+- [Console output](#console-output)
+- [Context and rate-limit management](#context-and-rate-limit-management)
+- [Verified run](#verified-run)
+- [Troubleshooting](#troubleshooting)
+- [Design trade-offs](#design-trade-offs)
+- [Limitations](#limitations)
+- [Project layout](#project-layout)
+
+---
+
+## Quick start
+
+Requires Python 3.11+ and a [Groq API key](https://console.groq.com/keys).
+Node.js is needed only if you want the agent's `node --check` verification step
+to work.
 
 ```bash
+git clone https://github.com/asitgiri1234/converseai
+cd converseai
+
+python -m venv .venv
+.venv\Scripts\activate            # Windows
+# source .venv/bin/activate       # macOS / Linux
+
 pip install -r requirements.txt
-cp .env.example .env          # add GROQ_API_KEY
-python main.py --repo ./target-repo --task "Add a GET /notes/count endpoint."
+
+cp .env.example .env              # then edit .env and paste your key
 ```
 
-Defaults to `llama-3.3-70b-versatile`; `--model openai/gpt-oss-120b` and
-`qwen/qwen3.6-27b` also drive the tool loop correctly.
+Clone something for it to work on, and run:
+
+```bash
+git clone https://github.com/callicoder/node-easy-notes-app ./target-repo
+
+python main.py \
+  --repo ./target-repo \
+  --task "Add a GET /notes/count endpoint that returns the total number of notes as JSON."
+```
+
+Review what it did with `git -C target-repo diff`. The agent never commits, so
+`git -C target-repo checkout -- .` throws the run away.
+
+> **Work on a throwaway clone.** The agent writes files and runs shell commands
+> in the directory you point it at. See [Safety model](#safety-model).
+
+---
+
+## CLI reference
+
+```
+python main.py --repo PATH --task TEXT [--model ID] [--temperature F] [--max-turns N]
+```
+
+| Flag | Required | Default | Description |
+| --- | --- | --- | --- |
+| `--repo` | yes | — | Repository the agent may read and modify. Every tool is confined to it. |
+| `--task` | yes | — | The product request, in plain language. Vague is fine. |
+| `--model` | no | `$GROQ_MODEL`, else `llama-3.3-70b-versatile` | Any Groq model with tool-calling support. |
+| `--temperature` | no | `0.2` | Sampling temperature. Low suits a coding agent. |
+| `--max-turns` | no | `40` | Hard cap on model turns before the run aborts. |
+
+**Exit codes**
+
+| Code | Meaning |
+| --- | --- |
+| `0` | The agent finished and emitted its summary. |
+| `1` | The run failed — turn cap hit, or a Groq API error that survived retries. |
+| `2` | Bad input — `--repo` is not a directory, or `GROQ_API_KEY` is unset. |
+| `130` | Interrupted with Ctrl-C. |
+
+---
+
+## Configuration
+
+Read from the environment, or from a `.env` file loaded automatically at import
+(`.env` is gitignored; `.env.example` is the template).
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `GROQ_API_KEY` | yes | Groq credentials. |
+| `GROQ_MODEL` | no | Overrides the default model; `--model` overrides this. |
+
+### Choosing a model
+
+Any Groq model with tool-calling support works. These three were tested against
+the notes app and all drive the loop correctly:
+
+| Model | Free-tier TPM | Notes |
+| --- | --- | --- |
+| `llama-3.3-70b-versatile` | 12,000 | **Default.** Most token headroom, which matters most. Follows the phase structure loosely. |
+| `openai/gpt-oss-120b` | 8,000 | Best judgement of the three in testing — the [verified run](#verified-run) used it. Tighter token budget. |
+| `qwen/qwen3.6-27b` | 8,000 | Works; least tested. |
+
+Token-per-minute headroom matters more than raw capability here, because an
+agent replays its whole conversation on every single turn. See
+[Context and rate-limit management](#context-and-rate-limit-management).
+
+---
 
 ## Architecture
 
 Five modules, one direction of control. `loop` is the only stateful piece: the
-Messages API is stateless, so it owns the conversation history and replays it
-on every request.
+chat-completions API is stateless, so the loop owns the conversation history and
+replays it every turn.
 
 ```
-  main.py ──── parses --repo/--task, binds the repo root, exits cleanly
+  main.py ──── parses --repo/--task, binds the repo root, maps exit codes
      │
      ▼
   agent/loop.py ───────────────────────────────────────────┐
-     │  history: [user task, assistant, tool_results, …]   │
+     │  history: [user task, assistant, tool results, …]   │
      │                                                     │
      ├──▶ agent/prompts.py    system prompt (phases, rules)│
      │                                                     │
@@ -35,131 +141,324 @@ on every request.
      │                                                     │
      └──▶ agent/tools.py ──▶ target repo (filesystem, shell)
             dispatch(name, input) → str ────────────────────┘
-                                    tool_result blocks re-enter history
+                         role="tool" messages re-enter history
 ```
 
-- **`main.py`** — CLI surface. Validates `--repo`, binds it as the tool root,
-  maps exceptions to exit codes (2 = bad input, 1 = run failed, 130 = Ctrl-C).
-- **`agent/llm.py`** — thin chat-completions wrapper. One call, one
-  `ChatCompletion` returned unmodified. Tools go out in OpenAI function
-  format; calls come back on `message.tool_calls` with arguments as a JSON
-  *string*, so the loop parses (and validates) them.
-- **`agent/prompts.py`** — the stable system prompt. Kept free of
-  interpolation so it stays a cacheable prefix; run-specific context (repo
-  path, task) goes in the first user message.
-- **`agent/tools.py`** — five tool schemas plus `dispatch(name, input)`, which
-  always returns a string and never raises.
-- **`agent/loop.py`** — the turn loop, retry policy, and console output.
+### Module responsibilities
 
-## Agent workflow phases
+| Module | Owns | Deliberately does *not* |
+| --- | --- | --- |
+| `main.py` | Argument parsing, `--repo` validation, binding the tool root, exit codes | Know anything about turns or tools |
+| `agent/llm.py` | Client construction, model defaults, one request/response | Loop, retry, or interpret the response |
+| `agent/prompts.py` | The stable system prompt and the opening user message | Know about tools or the API |
+| `agent/tools.py` | Tool schemas, filesystem/shell execution, path and command safety | Know that an LLM exists |
+| `agent/loop.py` | History, turn sequencing, retries, context elision, console output | Implement any tool itself |
 
-The system prompt drives five phases; the console narrates each turn.
+`agent/llm.py` returns the raw `ChatCompletion` unmodified, so the loop can
+inspect `choices[0].message.tool_calls` and `finish_reason` itself. Swapping
+providers means rewriting `llm.py` and the two format-handling helpers in
+`loop.py` — nothing else.
 
-1. **EXPLORE** — `list_files`, then `package.json` (entry point, scripts,
-   deps, CommonJS vs ESM), then routes, models, controllers. No path guessing.
-2. **PLAN** — a numbered `PLAN:` block naming the feature chosen, every file
-   to be touched with a reason, and any `Assumption:` — emitted *before* the
-   first edit. Ambiguity is resolved by picking the smallest reasonable
-   reading and stating it, never by asking (nothing is watching to answer).
-3. **IMPLEMENT** — `write_file`, preserving existing routes, exports, response
-   shapes, and field names, matching the surrounding style. Additive and
-   backwards-compatible; no rewriting in another language or framework.
-4. **VERIFY** — re-read every modified file, `node --check` each changed file,
-   run `npm test` / `npm run lint` where they exist.
-5. **SUMMARIZE** — a `SUMMARY:` section listing every file changed and why.
+---
 
-`PLAN:` is text with no tool call, which a naive loop reads as "finished". So
-a text-only turn ends the run **only** when it contains `SUMMARY:`; otherwise
-the agent is nudged onward, capped at 3 nudges. The marker is defined once in
-`prompts.py` and imported by `loop.py`.
+## The agent workflow
+
+The system prompt drives five explicit phases.
+
+| Phase | What the agent does |
+| --- | --- |
+| **1. EXPLORE** | `list_files`, then `package.json` (entry point, scripts, deps, CommonJS vs ESM), then routes, models, controllers. Following `require()` chains rather than guessing at paths. |
+| **2. PLAN** | Emits a numbered `PLAN:` block — the feature chosen, every file it will touch with a reason, and any `Assumption:` — *before* the first edit. |
+| **3. IMPLEMENT** | `write_file`, preserving existing routes, exports, response shapes, and field names, matching the surrounding style. Additive and backwards-compatible. |
+| **4. VERIFY** | Re-reads every modified file, runs `node --check` on each changed file, runs `npm test` / `npm run lint` if they exist. |
+| **5. SUMMARIZE** | A `SUMMARY:` section listing every file changed and why. |
+
+### Handling ambiguity
+
+The agent runs unattended, so it is instructed never to ask a clarifying
+question. Given *"let users organise their notes better"* it picks the smallest
+reasonable interpretation, writes it into the plan as an explicit
+`Assumption:`, and builds that. You review the assumption in the output rather
+than answering a prompt mid-run.
+
+### Why `SUMMARY:` is the stop condition
+
+A naive loop stops when the model replies with text instead of a tool call. That
+breaks here: `PLAN:` *is* a text-only turn, so the run would end right after
+planning and before any edit.
+
+So a text-only turn ends the run **only** when it contains `SUMMARY:`.
+Otherwise the loop appends a short nudge and continues — capped at
+`MAX_NUDGES = 3`, so a model that never emits the marker still terminates
+rather than burning all 40 turns.
+
+`SUMMARY_MARKER` is defined once in `prompts.py` and imported by `loop.py`.
+Renaming it in one file and not the other silently breaks termination.
+
+---
 
 ## How repository exploration works
 
 Exploration is **tool-driven and LLM-decided**. There is no pre-indexing pass,
-no repo map built ahead of time, and no hardcoded traversal order. The agent
-receives five tools and a repo root, and chooses what to look at next based on
-what the last result told it — read `package.json`, discover
-`require('./app/routes/note.routes.js')`, read that, follow it to the
-controller, and so on.
+no repo map built ahead of time, no embeddings, and no hardcoded traversal
+order. The agent gets five tools and a repo root, and picks its next move from
+what the last result told it.
 
-| Tool | Behaviour |
+A real trace against the notes app:
+
+```
+list_files(".")                      → sees app/, config/, server.js
+read_file("package.json")            → main: server.js, deps: express, mongoose
+read_file("app/models/note.model.js")→ schema: title, content, timestamps
+read_file("app/controllers/…")       → five exports, promise chains, 4-space indent
+read_file("app/routes/note.routes.js")→ how routes are registered
+```
+
+Five calls, and it knows the module system, the conventions, and the request
+path. The trade-off is turn count: each step is a round trip, so exploring costs
+latency and tokens that a pre-built index would not. On a repo this size that is
+the right trade (see [Design trade-offs](#design-trade-offs)).
+
+---
+
+## Tool reference
+
+Tools are declared in OpenAI function format — Groq speaks the OpenAI
+chat-completions dialect — and executed client-side by `dispatch(name, input)`,
+which **always returns a string and never raises**.
+
+| Tool | Arguments | Behaviour | Limits |
+| --- | --- | --- | --- |
+| `list_files` | `path` (optional) | Indented recursive tree, directories before files | Skips `node_modules` and `.git`; 1,000 entries; won't follow symlinked dirs |
+| `read_file` | `path` | Contents with line numbers | 500 lines; refuses binaries (NUL-byte check) |
+| `search_code` | `pattern` | Regex across all text files → `file:line:match` | 50 results; skips binaries and files > 2 MB; match lines clipped to 200 chars |
+| `write_file` | `path`, `content` | Create or overwrite, creating parent directories | Reports created-vs-overwrote plus line and byte counts |
+| `run_shell` | `command` | Runs via the platform shell with `cwd` = repo root | 30 s timeout; output capped at 20,000 chars; returns exit code + stdout + stderr |
+
+Failures are returned as strings prefixed `Error:` — unknown tool, bad
+arguments, missing file, path escape, refused command — so the model reads what
+went wrong and adjusts instead of the run crashing.
+
+### Tool-call format
+
+Arguments arrive as a **JSON string** the model generated, so they can be
+malformed. The loop parses them with `json.loads` and, on failure, returns a
+`role: "tool"` message explaining the parse error. Every tool call gets exactly
+one reply carrying its `tool_call_id`; Groq rejects the next request otherwise.
+
+---
+
+## Safety model
+
+**Path containment.** Every model-supplied path is resolved — symlinks included
+— and rejected unless it lands inside the repo root. `../` traversal, absolute
+paths pointing elsewhere, and symlinks aimed outward all fail with
+`Error: path escapes the repository root`.
+
+**Command screening.** `run_shell` refuses:
+
+- privilege escalation — `sudo`, `su`, `doas`, `runas`
+- recursive/forced deletes whose target resolves outside the repo
+- `mkfs`, `dd of=/dev/…`, `shutdown`, `reboot`, and fork bombs
+
+> ### This is a guardrail, not a sandbox
+>
+> Anything that passes the screen runs with your full user privileges. It does
+> not stop `curl … | sh`, a `git push --force`, or a Python one-liner that
+> deletes files. **Run the agent against a throwaway clone**, or inside a
+> container, if that matters. The screen exists to catch obvious accidents, not
+> a determined adversary.
+
+---
+
+## Console output
+
+Each turn prints the model's reasoning preview, any assistant text, and every
+tool call with truncated input and a one-line result preview.
+
+```
+────────────────────────────────────────────────────────────────────────
+  converseai  →  groq / openai/gpt-oss-120b  (temp=0.2)
+  repo: /home/me/target-repo
+  task: Add a GET /notes/count endpoint that returns the total numb…
+────────────────────────────────────────────────────────────────────────
+
+[turn 4/40]
+  We need to add GET /notes/count endpoint returning total number of notes.
+  · read_file(path="app/controllers/note.controller.js")
+    ✓ 1 const Note = require('../models/note.model.js');  [116 lines]
+
+[turn 5/40]
+  PLAN:
+  1. Feature: Add a GET `/notes/count` endpoint returning `{ count: <number> }`.
+  2. Files to modify:
+  - `app/routes/note.routes.js` – register the route before `/:noteId`.
+  - `app/controllers/note.controller.js` – add a `count` export.
+  3. Assumption: the response is an object with a single `count` field.
+  · no SUMMARY: yet -- continuing
+
+[turn 12/40]
+  · run_shell(command="node --check app/controllers/note.controller.js")
+    ✓ exit code: 0  [2 lines]
+
+────────────────────────────────────────────────────────────────────────
+  ✓ done
+────────────────────────────────────────────────────────────────────────
+SUMMARY:
+- app/routes/note.routes.js – registered GET /notes/count before /:noteId.
+- app/controllers/note.controller.js – added a count handler using countDocuments().
+────────────────────────────────────────────────────────────────────────
+  20 turns  ·  18 tool calls  ·  558s  ·  82,482 in / 4,600 out tokens
+────────────────────────────────────────────────────────────────────────
+```
+
+Long string arguments are clipped to 60 characters, so a `write_file` carrying a
+whole file cannot flood the screen. Tool timings appear only for calls slower
+than 0.5 s. The box-drawing glyphs fall back to ASCII when the terminal cannot
+encode them — otherwise piping the output to a file would crash on Windows.
+
+---
+
+## Context and rate-limit management
+
+This is the part that decides whether a run finishes, so it is worth
+understanding.
+
+**The problem.** An agent replays its entire history every turn. Read one
+120-line file twice and most of a small tier's per-minute token budget is gone.
+
+**Groq bills `max_completion_tokens` up front**, against the same per-minute
+budget as the prompt. So `prompt + max_completion_tokens` must clear the TPM
+ceiling, and the ceiling is squeezed from both directions:
+
+| `max_completion_tokens` | Failure |
 | --- | --- |
-| `list_files(path)` | Indented tree; skips `node_modules` and `.git`; caps at 1000 entries |
-| `read_file(path)` | Line-numbered; truncates past 500 lines; refuses binaries |
-| `search_code(pattern)` | Regex → `file:line:match`; caps at 50 results |
-| `write_file(path, content)` | Create or overwrite, making parent dirs |
-| `run_shell(command)` | `cwd=repo`, 30 s timeout, returns exit code + stdout + stderr |
+| Too high | `413` — request larger than the TPM limit, before the model runs |
+| Too low | `write_file`'s whole-file argument truncates mid-JSON → `400 tool_use_failed` |
 
-Every path is resolved (symlinks included) and rejected unless it lands inside
-the repo root, so `../`, absolute paths, and outward symlinks all fail.
-`run_shell` refuses privilege escalation (`sudo`, `su`, `doas`, `runas`),
-recursive deletes aimed outside the repo, and `mkfs` / `dd of=/dev/…` /
-`shutdown` / fork bombs. **This is a guardrail, not a sandbox** — anything that
-passes runs with your full privileges. Use a throwaway checkout.
+`DEFAULT_MAX_TOKENS = 1800` threads that gap for a file of roughly 120 lines.
 
-## Assumptions and trade-offs
+**History elision.** Tool results older than the last `KEEP_TOOL_RESULTS = 4`
+are replaced with a placeholder in the *request* — the real history is kept
+intact. Only the `content` is swapped, never the message, because each
+`role: "tool"` entry must keep its `tool_call_id` to answer the call that
+requested it. The placeholder tells the model it may re-read the file.
 
-- **Single-agent loop, not multi-agent.** One conversation, one context
-  window, tools executed in sequence. A planner/worker/reviewer split would
-  parallelise wide tasks and give a second opinion on the diff, at the cost of
-  cross-agent coordination and roughly N× the tokens. For a five-file repo the
-  coordination overhead would exceed the benefit. This does mean no
-  independent review of the agent's own output — the VERIFY phase is the same
-  model marking its own homework.
-- **Whole-file writes, not diff edits.** `write_file` replaces the entire
-  file, so the agent must reproduce everything it isn't changing. Simple and
-  unambiguous, and it can't produce a malformed hunk — but it costs output
-  tokens proportional to file size and risks silent truncation on large files.
-  A `str_replace`-style edit tool would be the right call above a few hundred
-  lines.
-- **No vector indexing or embeddings.** `node-easy-notes-app` is six source
-  files; `list_files` plus a regex `search_code` finds anything in one or two
-  calls. Embedding a repo this size would add an indexing step, a dependency,
-  and a staleness problem to solve a retrieval issue that doesn't exist here.
-  It would become worth it somewhere in the thousands-of-files range.
-- **Read-before-write is instructed, not enforced.** The prompt requires it;
-  nothing in the harness blocks a `write_file` on an unread path.
-- **History is elided, not summarised.** Tool results older than the last four
-  are replaced with a placeholder in the *request* (the real history is kept),
-  which is cheap and lossless-by-reference — the agent can re-read — but it
-  does cause repeat reads. Real compaction would summarise instead.
-- **Git is untouched.** No branch, no commit, no rollback. Review with
-  `git diff` in the target repo and revert by hand.
+**Retries.** Three attempts. Rate-limited responses honour the `retry-after`
+header (exponential backoff would retry long before a per-minute window rolls
+over); `tool_use_failed` is retried as a generation artifact; other 4xx errors
+raise immediately, since they will fail identically.
 
-## What a real run looks like
+---
 
-Verified end to end against `callicoder/node-easy-notes-app` on
-`openai/gpt-oss-120b`: 20 turns, 18 tool calls, ~9 minutes, 82k prompt / 4.6k
-completion tokens, finishing with a `SUMMARY:`. All five phases fired, and the
-model got the non-obvious part right — it registered `/notes/count` *before*
-`/notes/:noteId` so Express wouldn't shadow it, and `node --check` passed on
-both edited files.
+## Verified run
 
-The diff was still poor: it reformatted the entire controller (`if(` → `if (`,
-promise-chain reindentation) alongside the 12 lines the feature needed — 84
-insertions and 63 deletions for a small change. Whole-file writes let a model
-"tidy" everything it retypes, and these models do.
+Against `callicoder/node-easy-notes-app` on `openai/gpt-oss-120b`:
+
+| | |
+| --- | --- |
+| Turns | 20 of 40 |
+| Tool calls | 18 |
+| Wall clock | 558 s |
+| Tokens | 82,482 prompt / 4,600 completion |
+| Result | Exit 0, ended with `SUMMARY:` |
+
+All five phases fired. The agent got the non-obvious part right: it registered
+`/notes/count` **before** `/notes/:noteId`, so Express would not shadow the new
+route with the parameterised one. Both edited files passed `node --check`.
+
+**The diff was still poor.** Alongside the ~12 lines the feature needed, it
+reformatted the whole controller — `if(` → `if (`, promise chains reindented —
+for a total of 84 insertions and 63 deletions. Whole-file writes let a model
+tidy everything it retypes, and these models take the invitation.
+
+On the vaguer task (*"better organise and search their notes"*) with
+`llama-3.3-70b-versatile`, it re-emitted its `PLAN:` six times without
+progressing, then implemented a `findByTag` handler but exhausted the daily
+token budget before registering its route — leaving unreachable dead code.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `error: GROQ_API_KEY is not set` | No key in env or `.env` | `cp .env.example .env`, add the key |
+| `413 … Request too large … tokens per minute` | `prompt + max_completion_tokens` exceeds TPM | Use a higher-TPM model, or lower `DEFAULT_MAX_TOKENS` in `agent/llm.py` |
+| `400 … tool_use_failed` | Model's tool-call JSON truncated mid-write | Raise `DEFAULT_MAX_TOKENS`; retried automatically once |
+| `429 … tokens per day (TPD)` | Daily free-tier budget exhausted for that model | Switch `--model`, or wait for the reset |
+| Run ends at the turn cap | Task too large, or the model is looping | Narrow the task, or raise `--max-turns` |
+| Agent re-plans repeatedly | Weaker model following the phase prompt loosely | Try `--model openai/gpt-oss-120b` |
+| `npm test` always fails | The notes app defines `test` as `exit 1` | Expected; `node --check` is the meaningful signal |
+| Mojibake instead of `─ · → ✓` | Terminal cannot encode the glyphs | Handled automatically — it falls back to ASCII |
+
+---
+
+## Design trade-offs
+
+**Single-agent loop, not multi-agent.** One conversation, one context window,
+tools executed in sequence. A planner/worker/reviewer split would parallelise
+wide tasks and give an independent opinion on the diff, at the cost of
+cross-agent coordination and roughly N× the tokens. For a six-file repo the
+coordination overhead would exceed the benefit. The cost: no independent review
+— the VERIFY phase is the same model marking its own homework.
+
+**Whole-file writes, not diff edits.** `write_file` replaces the entire file, so
+the agent must reproduce everything it is not changing. Simple, unambiguous, and
+it cannot produce a malformed hunk. But it costs output tokens proportional to
+file size, risks truncation on large files, and invites gratuitous reformatting
+— all three were observed. A `str_replace`-style edit tool is the right call
+above a few hundred lines.
+
+**No vector indexing or embeddings.** The target is six source files;
+`list_files` plus one regex `search_code` finds anything in a call or two.
+Embedding a repo this size adds an indexing step, a dependency, and a staleness
+problem to solve a retrieval issue that does not exist. It starts paying off
+somewhere in the thousands-of-files range.
+
+**Read-before-write is instructed, not enforced.** The prompt requires it;
+nothing in the harness blocks a `write_file` on an unread path.
+
+**History is elided, not summarised.** Cheap and lossless-by-reference — the
+agent can re-read — but it does cause repeat reads. Real compaction would
+summarise instead.
+
+**Git is untouched.** No branch, no commit, no rollback. Review with `git diff`
+and revert by hand.
+
+---
 
 ## Limitations
 
-- **Model quality dominates.** On the vaguer task ("better organise and search
-  their notes"), `llama-3.3-70b-versatile` re-emitted its `PLAN:` six times
-  without progressing, burning most of a daily token budget before it started
-  editing. The phase prompt is followed loosely, not reliably.
-- **Free-tier token limits are the real ceiling.** Groq bills
-  `max_completion_tokens` against the per-minute budget *up front*, so
-  `prompt + max_completion_tokens` must fit under the TPM limit — 8k on most
-  models, 12k on `llama-3.3-70b-versatile`. Too high and requests 413; too low
-  and `write_file`'s whole-file argument truncates mid-JSON and Groq rejects
-  the call. The default (1800) threads that gap for a ~120-line file, and the
-  loop elides older tool results from each request to keep history small. A
-  larger repo will need a paid tier.
-- `node-easy-notes-app` defines `"test": "echo \"Error: no test specified\" &&
-  exit 1"`. VERIFY's `npm test` step will *always* fail there, and the agent
-  may waste turns trying to fix it. `node --check` is the meaningful signal.
-- Tool calls execute sequentially even when the model requests several at once.
-- No checkpointing: a run that fails at turn 30 starts over from turn 1.
-- History grows unbounded; a long run can approach the context window with no
-  compaction.
-- The 40-turn cap is a blunt stop. Hitting it leaves the repo in whatever
-  half-edited state the agent reached.
+- **Model quality dominates outcomes.** The phase structure is followed loosely,
+  not reliably. Weaker models re-plan in circles, reformat files they were told
+  to leave alone, and occasionally emit malformed tool-call JSON.
+- **Free-tier token limits are the practical ceiling.** 8,000 TPM on most Groq
+  models, 12,000 on `llama-3.3-70b-versatile`, plus a daily cap. A repo much
+  larger than the notes app needs a paid tier.
+- **No independent verification.** The model checks its own work.
+- **No checkpointing.** A run that fails at turn 30 starts over at turn 1.
+- **Tool calls execute sequentially**, even when the model requests several at
+  once.
+- **The 40-turn cap is a blunt stop.** Hitting it leaves the repository in
+  whatever half-edited state the agent reached.
+- **Tested on one repository.** Behaviour on larger or differently structured
+  Express projects is unmeasured.
+
+---
+
+## Project layout
+
+```
+converseai/
+├── main.py              CLI entry point
+├── agent/
+│   ├── __init__.py
+│   ├── llm.py           Groq client wrapper — one request, one response
+│   ├── loop.py          Turn loop, retries, context elision, console output
+│   ├── prompts.py       System prompt (five phases) and the opening message
+│   └── tools.py         Tool schemas, dispatch, path and command safety
+├── requirements.txt     groq, python-dotenv
+├── .env.example         Template for .env (gitignored)
+└── target-repo/         Whatever you clone to work on (gitignored)
+```
