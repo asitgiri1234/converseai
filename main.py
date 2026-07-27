@@ -11,6 +11,7 @@ from pathlib import Path
 
 from agent.llm import LLM, MissingAPIKeyError
 from agent.loop import run
+from agent.tools import set_repo_root
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -58,6 +59,9 @@ def main(argv: list[str] | None = None) -> int:
     if not repo.is_dir():
         print(f"error: --repo is not a directory: {repo}", file=sys.stderr)
         return 2
+
+    # Confines every tool to this directory for the rest of the process.
+    set_repo_root(repo)
 
     try:
         llm = LLM(model=args.model, effort=args.effort)

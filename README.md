@@ -7,10 +7,39 @@ Python 3.11+. Dependencies: `anthropic`, `python-dotenv`.
 
 ## Status
 
-Scaffolding. `agent/llm.py` and the CLI are working; the agent loop
-(`agent/loop.py`), the tools (`agent/tools.py`), and the prompts
-(`agent/prompts.py`) are stubs with docstrings describing what each piece
-needs to do.
+Scaffolding. `agent/llm.py`, `agent/tools.py`, and the CLI are working; the
+agent loop (`agent/loop.py`) and the prompts (`agent/prompts.py`) are stubs
+with docstrings describing what each piece needs to do.
+
+## Tools
+
+`agent/tools.py` exports `TOOLS` (the schemas sent to the model) and
+`dispatch(name, input)` (the client-side executor, which always returns a
+string and never raises).
+
+| Tool | Behaviour |
+| --- | --- |
+| `list_files(path)` | Indented recursive tree; skips `node_modules` and `.git`; caps at 1000 entries |
+| `read_file(path)` | Contents with line numbers; truncates past 500 lines; refuses binaries |
+| `search_code(pattern)` | Regex grep returning `file:line:match`; caps at 50 results |
+| `write_file(path, content)` | Create or overwrite, making parent dirs |
+| `run_shell(command)` | Runs with `cwd=repo`, 30s timeout, returns exit code + stdout + stderr |
+
+Call `set_repo_root(path)` once before any tool runs — `main.py` does this
+after validating `--repo`.
+
+### Safety model
+
+Every path is resolved (symlinks included) and rejected unless it lands inside
+the repo root, so `../`, absolute paths, and symlinks pointing out all fail.
+`run_shell` additionally refuses privilege escalation (`sudo`, `su`, `doas`,
+`runas`), recursive deletes aimed outside the repo, and a short list of
+machine-destroying commands (`mkfs`, `dd of=/dev/…`, `shutdown`, `reboot`,
+fork bombs).
+
+This is a guardrail, not a sandbox: a command that passes the check runs with
+your full privileges. Run the agent against a throwaway checkout, or in a
+container, if that matters.
 
 ## Setup
 

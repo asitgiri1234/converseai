@@ -6,7 +6,7 @@ the model again until the model stops asking for tools.
 
 Shape of one iteration:
 
-    response = llm.complete(messages, tools=TOOL_SCHEMAS, system=...)
+    response = llm.complete(messages, tools=TOOLS, system=...)
     messages.append({"role": "assistant", "content": response.content})
     if response.stop_reason != "tool_use":
         break
@@ -36,7 +36,9 @@ def run(repo: Path, task: str, llm: LLM | None = None, max_turns: int = MAX_TURN
     """Run the agent against a repository until the task is done.
 
     Args:
-        repo: Repository root the agent is allowed to read and modify.
+        repo: Repository root the agent is allowed to read and modify. Pass it
+            to `agent.tools.set_repo_root` before the first turn (``main.py``
+            already does this; re-binding is harmless).
         task: Natural-language description of what the agent should do.
         llm: Model wrapper to use. A default ``LLM()`` is constructed if
             omitted.
@@ -52,17 +54,21 @@ def run(repo: Path, task: str, llm: LLM | None = None, max_turns: int = MAX_TURN
     raise NotImplementedError
 
 
-def _handle_tool_use(repo: Path, response: Any) -> list[dict[str, Any]]:
+def _handle_tool_use(response: Any) -> list[dict[str, Any]]:
     """Execute every ``tool_use`` block in a response.
 
+    Tools are already bound to the repo root by `agent.tools.set_repo_root`,
+    so nothing is passed through here.
+
     Args:
-        repo: Repository root, forwarded to `agent.tools.dispatch`.
         response: The ``Message`` returned by `agent.llm.LLM.complete`.
 
     Returns:
         One ``tool_result`` block per ``tool_use`` block, in the same order,
         each carrying the matching ``tool_use_id``. The API rejects the next
-        request if any ``tool_use`` id is left without a result.
+        request if any ``tool_use`` id is left without a result. Results from
+        `agent.tools.dispatch` that start with ``Error:`` should carry
+        ``is_error: true``.
     """
     raise NotImplementedError
 
