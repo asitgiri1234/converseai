@@ -24,7 +24,7 @@ from typing import Any
 import anthropic
 
 from agent.llm import LLM
-from agent.prompts import build_system_prompt, build_task_message
+from agent.prompts import SUMMARY_MARKER, build_system_prompt, build_task_message
 from agent.tools import TOOLS, dispatch, set_repo_root
 
 # Safety valve: stop after this many model turns even if the agent is still
@@ -37,7 +37,20 @@ RETRY_BASE_DELAY = 2.0
 
 MAX_INPUT_PREVIEW = 160
 MAX_RESULT_PREVIEW = 110
-MAX_TEXT_PREVIEW = 500
+MAX_TEXT_PREVIEW = 100
+MAX_TEXT_LINES = 16
+
+# The agent works in phases (see agent.prompts) and its PLAN phase is text
+# with no tool call, which would otherwise read as "finished". So a text-only
+# turn ends the run only once it carries the summary marker; before that the
+# agent gets nudged back to work, at most this many times so a model that
+# never emits the marker still terminates.
+MAX_NUDGES = 3
+NUDGE = (
+    "That was not a summary, so the task is not finished. Continue with the "
+    "next phase now, using tools. When the work is genuinely complete and "
+    f"verified, reply with your {SUMMARY_MARKER} section."
+)
 
 
 # --------------------------------------------------------------------------
@@ -159,6 +172,7 @@ def run(
     started = time.monotonic()
     tokens_in = tokens_out = 0
     tool_calls = 0
+    nudges = 0
 
     for turn in range(1, max_turns + 1):
         # Header first, so a slow call or a retry notice lands under the turn
@@ -184,6 +198,16 @@ def run(
             if response.stop_reason == "max_tokens":
                 _say(f"  {_BAD} response hit max_tokens and may be cut short")
             final = _final_text(response)
+
+            # A phase like PLAN ends a turn with text and no tool call. That
+            # is mid-run, not done, so only the summary marker stops the loop.
+            if SUMMARY_MARKER not in final and nudges < MAX_NUDGES:
+                nudges += 1
+                _log_text(response)
+                _say(f"  {_CALL} no {SUMMARY_MARKER} yet -- continuing")
+                messages.append({"role": "user", "content": NUDGE})
+                continue
+
             _log_summary(final)
             _log_footer(time.monotonic() - started, turn, tool_calls, tokens_in, tokens_out)
             return final
@@ -297,10 +321,20 @@ def _log_thinking(response: Any) -> None:
 
 
 def _log_text(response: Any) -> None:
-    """Print any assistant text that accompanied a batch of tool calls."""
+    """Print assistant text, keeping its line structure.
+
+    The PLAN phase is a numbered list, so flattening it to one line would make
+    the most informative moment of a run the least readable one.
+    """
     text = _final_text(response)
-    if text:
-        _say(f"  {_clip(_flatten(text), MAX_TEXT_PREVIEW)}")
+    if not text:
+        return
+
+    lines = text.splitlines()
+    for line in lines[:MAX_TEXT_LINES]:
+        _say(f"  {_clip(line, MAX_TEXT_PREVIEW)}" if line.strip() else "")
+    if len(lines) > MAX_TEXT_LINES:
+        _say(f"  … {len(lines) - MAX_TEXT_LINES} more lines")
 
 
 def _log_summary(final: str) -> None:

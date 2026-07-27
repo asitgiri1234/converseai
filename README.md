@@ -39,10 +39,37 @@ Added src/health.py with a health() endpoint. Tests pass.
 ────────────────────────────────────────────────────────────────────────
 ```
 
-The loop stops when the model replies with text instead of tool calls, and
+The loop stops when the agent replies with a `SUMMARY:` section, and
 hard-stops at 40 turns (`--max-turns`). Transient API failures get one retry
 with exponential backoff; 4xx errors fail immediately. Box-drawing glyphs fall
 back to ASCII when the terminal can't encode them.
+
+## How the agent works
+
+The system prompt in [`agent/prompts.py`](agent/prompts.py) targets an
+existing **Node.js / Express / MongoDB** codebase and a vague product request,
+and drives five explicit phases:
+
+1. **EXPLORE** — list files; read `package.json` (entry point, scripts, deps,
+   CommonJS vs ESM), then routes, models, controllers. No guessing at paths.
+2. **PLAN** — emit a numbered `PLAN:` block naming the feature chosen, every
+   file to be touched with a reason, and any `Assumption:` made — before any
+   edit. Ambiguity is resolved by picking the smallest reasonable reading and
+   stating it, never by asking.
+3. **IMPLEMENT** — `write_file`, preserving existing routes, exports, response
+   shapes and field names, matching the codebase's existing style. Additive
+   and backwards-compatible; no rewriting in another language, framework, or
+   module system.
+4. **VERIFY** — re-read every modified file, `node --check` each changed JS
+   file, run `npm test` / `npm run lint` where they exist.
+5. **SUMMARIZE** — a `SUMMARY:` section listing every file changed and why.
+
+Because PLAN is text with no tool call, and the loop would otherwise read that
+as "finished", the loop treats a text-only turn as terminal **only** when it
+contains `SUMMARY:`; otherwise it nudges the agent onward, up to 3 times so a
+model that never emits the marker still terminates. `SUMMARY_MARKER` is
+defined in `prompts.py` and imported by `loop.py` — rename it in one place
+only and the stop condition breaks.
 
 ## Tools
 
