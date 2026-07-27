@@ -1,4 +1,5 @@
 .env
+target-repo/
 __pycache__/
 *.py[cod]
 .venv/
