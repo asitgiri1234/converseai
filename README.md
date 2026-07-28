@@ -20,11 +20,14 @@ narrated to the terminal as it happens.
 - [The agent workflow](#the-agent-workflow)
 - [How repository exploration works](#how-repository-exploration-works)
 - [Tool reference](#tool-reference)
+- [Message formats](#message-formats)
 - [Safety model](#safety-model)
 - [Console output](#console-output)
 - [Context and rate-limit management](#context-and-rate-limit-management)
 - [Verified run](#verified-run)
 - [Troubleshooting](#troubleshooting)
+- [Extending the agent](#extending-the-agent)
+- [Development and testing](#development-and-testing)
 - [Design trade-offs](#design-trade-offs)
 - [Limitations](#limitations)
 - [Project layout](#project-layout)
@@ -239,12 +242,68 @@ Failures are returned as strings prefixed `Error:` — unknown tool, bad
 arguments, missing file, path escape, refused command — so the model reads what
 went wrong and adjusts instead of the run crashing.
 
-### Tool-call format
+---
 
-Arguments arrive as a **JSON string** the model generated, so they can be
-malformed. The loop parses them with `json.loads` and, on failure, returns a
-`role: "tool"` message explaining the parse error. Every tool call gets exactly
-one reply carrying its `tool_call_id`; Groq rejects the next request otherwise.
+## Message formats
+
+Groq speaks the OpenAI chat-completions dialect. Three shapes matter, and
+getting any of them wrong produces a confusing API error rather than a clean
+failure — so they are worth stating explicitly.
+
+**1. Tool declarations** (`agent/tools.py`, built by the `_function` helper):
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "read_file",
+    "description": "Read a text file and return its contents with line numbers…",
+    "parameters": {
+      "type": "object",
+      "properties": { "path": { "type": "string", "description": "…" } },
+      "required": ["path"]
+    }
+  }
+}
+```
+
+**2. The assistant turn**, rebuilt field by field before it re-enters history.
+`content` may be empty when the model only calls tools, and `arguments` is a
+**JSON string**, not an object:
+
+```json
+{
+  "role": "assistant",
+  "content": "",
+  "tool_calls": [
+    {
+      "id": "fc_6febfae0",
+      "type": "function",
+      "function": { "name": "read_file", "arguments": "{\"path\":\"package.json\"}" }
+    }
+  ]
+}
+```
+
+**3. The tool reply** — one per call, carrying the matching id:
+
+```json
+{ "role": "tool", "tool_call_id": "fc_6febfae0", "content": "     1\t{\n…" }
+```
+
+Three rules the loop enforces:
+
+- **Every call gets exactly one reply.** Leave a `tool_call_id` unanswered and
+  the next request is rejected.
+- **The assistant message must keep its `tool_calls`.** Appending only the text
+  leaves the tool replies answering nothing.
+- **Arguments are model-generated JSON and may be malformed.** They are parsed
+  with `json.loads`; on failure the loop returns a `role: "tool"` message
+  describing the parse error, so the model can re-issue the call.
+
+The assistant entry is reconstructed rather than dumped from the SDK model, so
+provider-specific fields (`reasoning`, `refusal`, null `function_call`) never
+leak back into the next request.
 
 ---
 
@@ -391,6 +450,116 @@ token budget before registering its route — leaving unreachable dead code.
 | Agent re-plans repeatedly | Weaker model following the phase prompt loosely | Try `--model openai/gpt-oss-120b` |
 | `npm test` always fails | The notes app defines `test` as `exit 1` | Expected; `node --check` is the meaningful signal |
 | Mojibake instead of `─ · → ✓` | Terminal cannot encode the glyphs | Handled automatically — it falls back to ASCII |
+
+---
+
+## Extending the agent
+
+### Adding a tool
+
+Four steps, all in `agent/tools.py`:
+
+1. **Write the function.** It takes plain keyword arguments and returns a
+   `str`. Report failures as a returned string starting with `Error:` — never
+   raise, and never return a non-string.
+
+   ```python
+   def git_diff(path: str = ".") -> str:
+       """Show uncommitted changes under path."""
+       try:
+           target = _resolve(path)      # rejects anything outside the repo root
+       except PathEscapeError as exc:
+           return f"Error: {exc}"
+       ...
+       return output
+   ```
+
+2. **Declare it** in `TOOLS` via the `_function` helper. The description is
+   what the model reads to decide *when* to reach for it, so say when it
+   applies, not just what it does.
+
+3. **Register it** in `_IMPLEMENTATIONS`, mapping the schema name to the
+   function. `dispatch` routes on that dict and reports unknown names against
+   it.
+
+4. **Resolve every path through `_resolve`.** That is the only thing keeping a
+   model-supplied path inside the repo root.
+
+No change to `loop.py` is needed — it discovers tools through `TOOLS` and
+`dispatch`.
+
+### Changing the workflow
+
+The phases live entirely in `SYSTEM_PROMPT` in `agent/prompts.py`; there is no
+phase state machine in the loop. Editing that string changes how the agent
+works. Two couplings to respect:
+
+- `SUMMARY_MARKER` is the loop's stop condition. Change the marker in
+  `prompts.py` and the loop follows automatically — but change the wording *in
+  the prompt body only* and runs will never terminate cleanly.
+- Keep run-specific detail out of `SYSTEM_PROMPT`. Repo path and task belong in
+  `build_task_message`, which produces the first user message.
+
+### Switching providers
+
+`agent/llm.py` is the provider boundary. Moving off Groq means rewriting that
+module plus `_assistant_message` and `_handle_tool_calls` in `loop.py` — the
+two places that know the wire format. Tools, prompts, safety, and console
+output are provider-agnostic.
+
+---
+
+## Development and testing
+
+The loop can be exercised without spending a single token. `run()` accepts any
+object with `.model`, `.temperature`, and a `.complete()` returning something
+shaped like a `ChatCompletion`, so a scripted stub drives a whole run offline:
+
+```python
+import types
+from agent import loop
+
+def msg(content, tool_calls=None, finish="stop"):
+    message = types.SimpleNamespace(
+        content=content, tool_calls=tool_calls, reasoning=None
+    )
+    return types.SimpleNamespace(
+        choices=[types.SimpleNamespace(message=message, finish_reason=finish)],
+        usage=types.SimpleNamespace(prompt_tokens=100, completion_tokens=20),
+    )
+
+class FakeLLM:
+    model, temperature = "fake", 0.0
+    def __init__(self, script): self.script = list(script)
+    def complete(self, messages, tools=None, system=None, **kw):
+        return self.script.pop(0)
+
+loop.run(repo_path, "add an endpoint", llm=FakeLLM([msg("SUMMARY: done")]))
+```
+
+Worth covering with scripted turns: a text-only `PLAN:` turn (it must *not* end
+the run), the nudge cap, the turn cap raising `RuntimeError`, retry-then-succeed
+versus retries-exhausted, and malformed tool-call JSON. Assert that every
+`tool_call_id` is answered exactly once and that the assistant entry keeps its
+`tool_calls`.
+
+The tools are independently testable with no model at all — bind a temporary
+directory and call `dispatch` directly:
+
+```python
+from agent.tools import set_repo_root, dispatch
+
+set_repo_root("/tmp/scratch-repo")
+print(dispatch("list_files", {}))
+print(dispatch("read_file", {"path": "../../etc/passwd"}))   # Error: path escapes…
+print(dispatch("run_shell", {"command": "sudo rm -rf /"}))   # Error: refusing…
+```
+
+There is no committed test suite yet — these are the patterns the code was
+verified with, not something you can run with `pytest` today.
+
+**Compatibility note.** The code targets Python 3.11+ (`X | None` annotations,
+`Path.is_relative_to`) and has been exercised on 3.13.
 
 ---
 
