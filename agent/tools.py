@@ -470,6 +470,23 @@ def search_repo(question: str) -> str:
     return repo_search.render(question, hits)
 
 
+def run_validation() -> str:
+    """Run the multi-step validation pipeline over the current working tree.
+
+    Returns:
+        Every check with its outcome, plus the confidence score.
+    """
+    from agent import memory as repo_memory
+    from agent import validate as validator
+
+    global _search_memory
+    if _search_memory is None:
+        _search_memory = repo_memory.build_memory(get_repo_root())
+
+    report = validator.validate(get_repo_root(), _search_memory)
+    return report.render()
+
+
 def _check_command(command: str) -> None:
     """Refuse obviously destructive shell commands.
 
@@ -783,6 +800,18 @@ TOOLS: list[dict[str, Any]] = [
         ["path", "content"],
     ),
     _function(
+        "run_validation",
+        "Run the full validation pipeline over your changes: syntax checks, "
+        "module export contracts, route integrity (handlers exist, no route "
+        "shadowed by an earlier parameterised one), the project's tests, and "
+        "a live endpoint probe if a server is already running. Returns every "
+        "check plus a confidence score. Call this during VERIFY, before you "
+        "write your summary -- the same pipeline runs automatically when you "
+        "finish, and a low score sends you back to planning.",
+        {},
+        [],
+    ),
+    _function(
         "run_shell",
         "Run a shell command with the repository as the working directory. "
         "Call this to run tests, linters, build steps, or git. Commands are "
@@ -806,6 +835,7 @@ _IMPLEMENTATIONS: dict[str, Callable[..., str]] = {
     "edit_file": edit_file,
     "insert_after": insert_after,
     "write_file": write_file,
+    "run_validation": run_validation,
     "run_shell": run_shell,
 }
 

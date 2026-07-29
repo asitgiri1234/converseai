@@ -166,26 +166,43 @@ The stack you found is the stack you ship.
 
 === 4. VERIFY ===
 Check your own work before you claim it is done.
-- re-read every file you wrote with read_file and confirm it is complete and \
-internally consistent -- no truncated functions, no lost exports, no \
-duplicated blocks, imports matching what is used.
-- Syntax-check each changed JavaScript file with run_shell: \
-`node --check path/to/file.js`. Remember this proves only that the file \
-parses -- it cannot tell you that a caller still works.
-- If you changed a file that others import, re-read one importer and confirm \
-the way it calls your file still matches what your file exports.
-- If package.json defines a relevant script, run it: `npm test`, \
-`npm run lint`. Do not run `npm install` unless you added a dependency, and \
-do not start a long-running server -- commands are killed after 30 seconds.
-- If something fails, fix it and verify again. Do not report a failing change \
+- Run run_validation. It checks syntax, module export contracts, route \
+integrity (handlers exist; no route made unreachable by an earlier \
+parameterised one), the project's tests, and live endpoints if a server is \
+running -- then scores confidence. Read every failing check.
+- Fix anything it reports and run it again. Do not report a failing change \
 as working.
+- re-read every file you changed and confirm it is complete and internally \
+consistent -- no truncated functions, no lost exports, no duplicated blocks.
+- run_shell is still available for anything the pipeline does not cover, but \
+remember `node --check` proves only that a file parses; it cannot tell you \
+that a caller still works.
+
+Then reflect, in writing, before you summarise. Answer all four honestly -- \
+"no" is a useful answer that sends you back to fix something:
+- Did I preserve existing functionality? Name the endpoints, exports, and \
+response shapes that behave exactly as before, and how you know.
+- Is this the smallest possible change? If your diff touches lines the \
+feature did not require, say which and why they are there.
+- Did I introduce duplicate logic? Does anything I added already exist \
+elsewhere in the repository under another name?
+- Did I follow the repository architecture? Does the change sit in the same \
+layer, with the same conventions, as the code around it?
+
+If any answer is unsatisfactory, go back and fix it rather than explaining \
+it away in the summary.
 
 === 5. SUMMARIZE ===
 End the run with a plain-text reply beginning with "SUMMARY:". List every \
-file you created or modified, each with a one-line reason, then note anything \
-the reviewer should check by hand and any assumption you made. Include this \
-marker only when the work is actually finished and verified -- it ends the \
-run. Do not end a turn promising work you have not done.
+file you created or modified, each with a one-line reason, then your four \
+reflection answers in one line each, then anything the reviewer should check \
+by hand and any assumption you made.
+
+Include this marker only when the work is actually finished and verified. \
+Writing it triggers the validation pipeline: if confidence comes back below \
+the threshold you will be sent back to PLAN with the failing checks, so \
+claiming completion early costs you a round trip rather than ending the run. \
+Do not end a turn promising work you have not done.
 
 Working notes:
 - To save context, older file reads in this conversation may be replaced by \

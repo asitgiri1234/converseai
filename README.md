@@ -25,6 +25,7 @@ narrated to the terminal as it happens.
 - [How repository exploration works](#how-repository-exploration-works)
 - [Semantic search](#semantic-search)
 - [Patch-based editing](#patch-based-editing)
+- [The validation pipeline](#the-validation-pipeline)
 - [Tool reference](#tool-reference)
 - [Message formats](#message-formats)
 - [Safety model](#safety-model)
@@ -171,6 +172,7 @@ replays it every turn.
 | `agent/graph.py` | Relationships: imports, route wiring, call edges, DB touchpoints | Read the filesystem twice — it works from the scan |
 | `agent/search.py` | Question intent, multi-signal ranking, evidence strings | Call a model or an embedding service |
 | `agent/patch.py` | Locating an edit region, applying it, proving nothing else moved | Touch the filesystem — it is pure string work |
+| `agent/validate.py` | Running the five stages and scoring confidence | Trust the model's own account of whether it worked |
 | `agent/memory.py` | Module summaries, explored files, discovered APIs, compression source | Decide when to compress — the loop asks it |
 | `agent/llm.py` | Client construction, model defaults, one request/response | Loop, retry, or interpret the response |
 | `agent/prompts.py` | The stable system prompt and the opening user message | Know about tools or the API |
@@ -193,8 +195,8 @@ The system prompt drives five explicit phases.
 | **1. EXPLORE** | With the intelligence block present: targeted reads of only the files the task touches, located via the symbol index. Without it: `list_files`, then `package.json`, then following `require()` chains. |
 | **2. PLAN** | Emits a nine-section `PLAN:` block — understanding, interpretation, strategies, trade-offs, choice, files, risks, verification, impact — *before* the first edit, cited from the intelligence object. See [The planning stage](#the-planning-stage). |
 | **3. IMPLEMENT** | `write_file`, preserving existing routes, exports, response shapes, and field names, matching the surrounding style. Additive and backwards-compatible. |
-| **4. VERIFY** | Re-reads every modified file, runs `node --check` on each changed file, runs `npm test` / `npm run lint` if they exist. |
-| **5. SUMMARIZE** | A `SUMMARY:` section listing every file changed and why. |
+| **4. VERIFY** | Runs the five-stage [validation pipeline](#the-validation-pipeline) — syntax, export contracts, route integrity, tests, live endpoints — then answers four written reflection questions. |
+| **5. SUMMARIZE** | A `SUMMARY:` section listing every file changed, why, and the reflection answers. Triggers the confidence gate. |
 
 ### Handling ambiguity
 
@@ -664,6 +666,90 @@ and `module.exports = (app) => {` preserved.
 
 ---
 
+## The validation pipeline
+
+`node --check` proves a file parses. It does not prove the application works,
+and in this project it twice reported success on a broken change — once while
+the app was **dead at startup**, once while a new endpoint returned **404**.
+`agent/validate.py` exists because of those two failures, and has a dedicated
+check for each.
+
+### Five stages
+
+| # | Stage | What it does |
+| --- | --- | --- |
+| 1 | **Syntax** | `node --check` / `python -m py_compile` on every file changed versus git HEAD |
+| 2 | **Contracts** | A changed module's export shape must still fit its callers. Catches `module.exports = (app) => {…}` becoming an `express.Router` while `server.js` still calls it as a function |
+| 3 | **Routes** | Every route's handler must exist and be exported; no literal route may be registered *after* a parameterised one that swallows it |
+| 4 | **Tests** | `npm test` / `pytest`, with npm's `"no test specified"` placeholder recognised as *absent*, not *failing* |
+| 5 | **Endpoints** | Live HTTP probe when a server is already reachable: status codes and JSON body validation. Reports `skip`, never a false pass, when nothing is listening |
+
+Changed files come from `git diff --numstat HEAD` — git is the authority on
+what the working tree actually contains, not the agent's own bookkeeping.
+
+### Reflection
+
+Before summarising, the agent must answer four questions in writing:
+
+- Did I preserve existing functionality? *(name the endpoints and exports, and how you know)*
+- Is this the smallest possible change? *(if the diff touches lines the feature didn't need, say which)*
+- Did I introduce duplicate logic? *(does this already exist elsewhere under another name)*
+- Did I follow the repository architecture? *(same layer, same conventions)*
+
+The answers go in the summary. "No" is a useful answer that sends the agent
+back to fix something rather than explain it away.
+
+### Confidence scoring
+
+Scored **by the harness from what actually happened**, not self-reported. A
+model that has just written a broken change is the least reliable narrator of
+whether the change is broken.
+
+| Signal | Weight | Derived from |
+| --- | --- | --- |
+| Repository understanding | 25 | Did it read the files it changed? |
+| Implementation quality | 25 | Diff shape — lines removed versus added, total churn |
+| Verification results | 35 | Pass ratio across stages 1–3 and 5 |
+| Successful tests | 15 | Real suite passed / absent (half credit) / failed (zero) |
+
+A contract or route failure is **disqualifying rather than averaged** — the
+application is broken, and a good syntax score should not hide that.
+
+### The gate
+
+Writing `SUMMARY:` triggers the pipeline. Below **70/100** the agent is sent
+back to PLAN with the failing checks and the score breakdown, up to twice:
+
+```
+Validation scored 33/100, below the 70 needed to finish.
+Failing checks:
+  - [FAIL] contracts: app/routes/note.routes.js -- server.js calls it as a
+    function, but it no longer exports one -- the app will crash at startup
+
+Do not write a summary yet. Go back to PLAN: re-read the affected files,
+state what went wrong and how you will fix it, then implement the fix.
+```
+
+`run_validation` is also a tool, so the agent can check itself during VERIFY
+rather than discovering problems at the gate.
+
+### Measured against the real bugs
+
+Each was reproduced in a throwaway git clone:
+
+| Scenario | Syntax stage | Pipeline verdict | Confidence |
+| --- | --- | --- | --- |
+| Export contract broken (real startup crash) | **PASS** | FAIL — "will crash at startup" | **33** → replan |
+| Route shadowed by `/notes/:noteId` (real 404) | PASS | FAIL — "unreachable" | **52** → replan |
+| Route handler not exported | PASS | FAIL — "not defined or not exported" | low → replan |
+| Correct additive patch | PASS | all pass | **92** → finish |
+| Clean tree, no changes | — | no failures | 78 → finish |
+
+The first row is the whole argument for this pipeline: syntax passed, and the
+application was dead.
+
+---
+
 ## Tool reference
 
 Tools are declared in OpenAI function format — Groq speaks the OpenAI
@@ -679,6 +765,7 @@ which **always returns a string and never raises**.
 | `edit_file` | `path`, `old_text`, `new_text` | Replace one located region; everything else stays byte-identical | Anchor must be unique; returns the diff. See [Patch-based editing](#patch-based-editing) |
 | `insert_after` | `path`, `anchor`, `text` | Insert lines after a unique anchor, at a line boundary | For pure additions |
 | `write_file` | `path`, `content`, `overwrite` | Create a **new** file | Refuses an existing file unless `overwrite=true` |
+| `run_validation` | — | Runs the five-stage pipeline and returns every check plus the confidence score | See [The validation pipeline](#the-validation-pipeline) |
 | `run_shell` | `command` | Runs via the platform shell with `cwd` = repo root | 30 s timeout; output capped at 20,000 chars; returns exit code + stdout + stderr |
 
 Failures are returned as strings prefixed `Error:` — unknown tool, bad
@@ -1035,7 +1122,9 @@ class FakeLLM:
     model, temperature = "fake", 0.0
     def __init__(self, script): self.script = list(script)
     def complete(self, messages, tools=None, system=None, **kw):
-        return self.script.pop(0)
+        # Fall back rather than raise: the validation gate can ask for an
+        # extra turn if it sends the agent back to planning.
+        return self.script.pop(0) if self.script else msg("SUMMARY: done")
 
 loop.run(repo_path, "add an endpoint", llm=FakeLLM([msg("SUMMARY: done")]))
 ```
@@ -1110,6 +1199,18 @@ and revert by hand.
 - **Model quality dominates outcomes.** The phase structure is followed loosely,
   not reliably. Weaker models re-plan in circles, reformat files they were told
   to leave alone, and occasionally emit malformed tool-call JSON.
+- **The pipeline checks structure, not behaviour.** It proves handlers exist,
+  routes are reachable, and exports still fit their callers. It cannot tell
+  you the endpoint returns the *right* number — only that it returns valid
+  JSON without a 5xx, and only when a server happens to be running. A real
+  test suite remains the thing this cannot substitute for.
+- **Confidence is a heuristic, not a guarantee.** A change can score 92 and
+  still be wrong; the weights were chosen to make the observed failure modes
+  disqualifying, not from a calibration study.
+- **The pipeline gate has not run in a completed live agent run.** Every
+  stage, the scoring, and the replan gate are covered by tests against real
+  reproduced bugs, and stage 5 was exercised against a live server — but the
+  daily token budget ran out before an end-to-end model-driven run.
 - **A complete plan is not a safe change.** All nine sections can be present,
   including `RISKS` and `IMPACT` asserting nothing breaks, while the edit
   silently breaks the app — observed and documented in
@@ -1170,6 +1271,7 @@ converseai/
 │   ├── intel.py         Repository Intelligence Engine (pre-scan, no LLM)
 │   ├── memory.py        Repository memory + module summaries (compression)
 │   ├── patch.py         Patch engine: locate, apply, verify, diff
+│   ├── validate.py      Five-stage validation pipeline + confidence scoring
 │   ├── search.py        Semantic search: intent parsing, ranking, evidence
 │   ├── llm.py           Groq client wrapper — one request, one response
 │   ├── loop.py          Turn loop, retries, context elision, console output

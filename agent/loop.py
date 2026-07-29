@@ -25,6 +25,7 @@ from typing import Any
 import groq
 
 from agent import memory as repo_memory
+from agent import validate as validator
 from agent.llm import LLM
 from agent.prompts import (
     PLAN_SECTIONS,
@@ -89,6 +90,12 @@ KEEP_PLAN_FULL = 6
 # third try either, and every retry is a full request against the token
 # budget.
 MAX_PLAN_REPAIRS = 1
+
+# When the agent says it is finished, the pipeline runs and scores the work.
+# Below the threshold it goes back to planning rather than finishing -- but
+# only so many times, since a model that cannot fix it in two attempts is
+# unlikely to on the third, and each attempt costs a full request.
+MAX_REPLANS = 2
 
 
 # --------------------------------------------------------------------------
@@ -250,6 +257,7 @@ def run(
     nudges = 0
     plan_repairs = 0
     plan_seen = False
+    replans = 0
 
     for turn in range(1, max_turns + 1):
         # Header first, so a slow call or a retry notice lands under the turn
@@ -297,7 +305,29 @@ def run(
                 messages.append({"role": "user", "content": NUDGE})
                 continue
 
+            # The agent says it is done. Verify that independently before
+            # believing it.
+            report = _run_validation(repo, mem)
+            # Send it back only when there is something to act on. A low
+            # score with no failures and no changed files means the pipeline
+            # had nothing to measure -- absent evidence, not evidence of a
+            # problem, and re-planning against it would just burn turns.
+            actionable = report is not None and (report.failures or report.changed_files)
+            if (
+                actionable
+                and report.confidence < validator.CONFIDENCE_THRESHOLD
+                and replans < MAX_REPLANS
+            ):
+                replans += 1
+                messages.append({
+                    "role": "user",
+                    "content": _replan_message(report),
+                })
+                continue
+
             _log_summary(final)
+            if report is not None:
+                _log_validation(report)
             if mem:
                 _say(f"  memory: {mem.stats_line()}")
             _log_footer(time.monotonic() - started, turn, tool_calls, tokens_in, tokens_out)
@@ -648,6 +678,48 @@ def _normalise_path(mem: Any, path: str) -> str:
         return p.as_posix()
     except (ValueError, OSError):
         return path.replace("\\", "/")
+
+
+def _run_validation(repo: Path, mem: Any) -> Any:
+    """Run the validation pipeline, or return None if it cannot run.
+
+    A pipeline crash must never strand a finished run, so failures degrade to
+    "unverified" rather than propagating.
+    """
+    if mem is None:
+        return None
+    try:
+        return validator.validate(repo, mem)
+    except Exception as exc:  # noqa: BLE001 - never block finishing
+        _say(f"  {_BAD} validation pipeline failed ({exc}); finishing unverified")
+        return None
+
+
+def _log_validation(report: Any) -> None:
+    """Print the pipeline result under the summary."""
+    _say("")
+    for check in report.checks:
+        marker = {"pass": _OK, "fail": _BAD, "skip": _CALL}[check.status]
+        _say(f"  {marker} {check.render()}")
+    band = "high" if report.confidence >= 85 else (
+        "acceptable" if report.confidence >= validator.CONFIDENCE_THRESHOLD else "low"
+    )
+    breakdown = ", ".join(f"{k} {v:.0f}" for k, v in report.scores.items())
+    _say(f"  confidence: {report.confidence:.0f}/100 ({band})  [{breakdown}]")
+
+
+def _replan_message(report: Any) -> str:
+    """Send the agent back to planning with the evidence against it."""
+    failures = "\n".join(f"  - {c.render()}" for c in report.failures) or "  - (none individually, but the score is low)"
+    return (
+        f"Validation scored {report.confidence:.0f}/100, below the "
+        f"{validator.CONFIDENCE_THRESHOLD:.0f} needed to finish. "
+        f"Breakdown: {', '.join(f'{k} {v:.0f}' for k, v in report.scores.items())}.\n"
+        f"Failing checks:\n{failures}\n\n"
+        "Do not write a summary yet. Go back to PLAN: re-read the affected "
+        "files, state what went wrong and how you will fix it, then implement "
+        "the fix with edit_file and run_validation again."
+    )
 
 
 def _log_plan_coverage(text: str) -> list[str]:
