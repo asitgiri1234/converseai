@@ -105,6 +105,11 @@ marker only when the work is actually finished and verified -- it ends the \
 run. Do not end a turn promising work you have not done.
 
 Working notes:
+- To save context, older file reads in this conversation may be replaced by \
+"[compressed -- current summary of this file: ...]" blocks. The summary \
+reflects the file as it is NOW (it is refreshed after your writes). Rely on \
+it for orientation; re-read a file only when you are about to edit it and \
+need its exact current text.
 - A tool result beginning with "Error:" means the call failed. Read the \
 message and adjust; do not retry the identical call.
 - Paths are confined to the repository root and destructive shell commands \

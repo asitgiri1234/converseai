@@ -19,6 +19,8 @@ narrated to the terminal as it happens.
 - [Architecture](#architecture)
 - [The agent workflow](#the-agent-workflow)
 - [Repository Intelligence Engine](#repository-intelligence-engine)
+- [Knowledge graph and repository memory](#knowledge-graph-and-repository-memory)
+- [Context compression and token benchmark](#context-compression-and-token-benchmark)
 - [How repository exploration works](#how-repository-exploration-works)
 - [Tool reference](#tool-reference)
 - [Message formats](#message-formats)
@@ -140,9 +142,12 @@ replays it every turn.
   agent/loop.py ───────────────────────────────────────────┐
      │  history: [user task + intel, assistant, tools, …]  │
      │                                                     │
-     ├──▶ agent/intel.py      one deterministic pre-scan   │
-     │      (no LLM calls)     → RepoIntelligence object   │
-     │                          rendered into first message │
+     ├──▶ agent/memory.py     RepositoryMemory ───────────┐│
+     │      ├─ agent/intel.py   one deterministic pre-scan ││
+     │      └─ agent/graph.py   relationships + call edges ││
+     │      (no LLM calls)    module summaries feed both   ││
+     │                        the first message and the    ││
+     │                        loop's context compression ◀─┘│
      ├──▶ agent/prompts.py    system prompt (phases, rules)│
      │                                                     │
      ├──▶ agent/llm.py ──────▶ Groq chat completions       │
@@ -160,6 +165,8 @@ replays it every turn.
 | --- | --- | --- |
 | `main.py` | Argument parsing, `--repo` validation, binding the tool root, exit codes | Know anything about turns or tools |
 | `agent/intel.py` | The pre-scan: architecture detection, file roles, symbol index, rendering | Call the LLM, the network, or mutate anything |
+| `agent/graph.py` | Relationships: imports, route wiring, call edges, DB touchpoints | Read the filesystem twice — it works from the scan |
+| `agent/memory.py` | Module summaries, explored files, discovered APIs, compression source | Decide when to compress — the loop asks it |
 | `agent/llm.py` | Client construction, model defaults, one request/response | Loop, retry, or interpret the response |
 | `agent/prompts.py` | The stable system prompt and the opening user message | Know about tools or the API |
 | `agent/tools.py` | Tool schemas, filesystem/shell execution, path and command safety | Know that an LLM exists |
@@ -266,6 +273,107 @@ detection only. The block is labelled "pre-scanned, heuristic — verify" and
 the prompt tells the model to treat it as a map, not gospel. A scan failure
 never kills a run — the agent falls back to tool-driven exploration, and
 `--no-intel` forces that mode.
+
+---
+
+## Knowledge graph and repository memory
+
+The intelligence scan says *what exists*. `agent/graph.py` and
+`agent/memory.py` add *how it connects* and *what this run has learned*.
+
+### Knowledge graph (`agent/graph.py`)
+
+A directed graph over three node types — modules (`app/models/note.model.js`),
+symbols (`path::name`), and routes (`GET /notes`) — with five edge kinds:
+
+| Edge | Meaning | Extracted from |
+| --- | --- | --- |
+| `imports` | module → module | `require()` / `import` with the specifier resolved to a real repo file |
+| `reads_config` | module → config file | an import whose target is a detected config file |
+| `registers` | route → handler symbol | `app.get('/notes', notes.findAll)` resolved through the import alias |
+| `calls` | symbol → symbol | identifiers referenced inside a function's body span |
+| `db_call` | symbol → model file | model-object methods (`find`, `countDocuments`, `findByIdAndUpdate`, …) |
+
+Queries: `imports_of`, `importers_of` (parent modules), `handler_of(route)`,
+`calls_from(symbol)`, `db_methods_in(file)`, `reference_counts()`.
+
+Built on the notes app it resolves the whole request path —
+`server.js → routes → controller → model`, plus `server.js → config` — and
+wires all eight routes to their exact handler symbols:
+
+```
+- Module graph (file -> imports):
+    app/controllers/note.controller.js -> app/models/note.model.js
+    app/routes/note.routes.js -> app/controllers/note.controller.js
+    server.js -> app/routes/note.routes.js, config/database.config.js
+- Route wiring (route -> handler):
+    GET /notes/count -> app/controllers/note.controller.js::count
+    GET /notes/:noteId -> app/controllers/note.controller.js::findOne
+- Database touchpoints (file -> methods):
+    app/controllers/note.controller.js: countDocuments, find, findById, …
+```
+
+### Repository memory (`agent/memory.py`)
+
+One `RepositoryMemory` per run, holding the architecture summary, per-module
+summaries, the dependency graph, frequently referenced symbols, previously
+explored files, and previously discovered APIs.
+
+A **module summary** is deterministic, one line, and always current:
+
+```
+app/controllers/note.controller.js [controllers] (169 lines) -- defines create,
+findAll, findOne, update, delete, count, search, recent; imports
+app/models/note.model.js; DB calls: find, findById, findByIdAndUpdate,
+findByIdAndRemove, countDocuments
+```
+
+After every `write_file`, memory re-indexes that file and rebuilds the graph,
+so a summary reflects the repository as it *now* is — a handler the agent
+added this run shows up in its own summary immediately.
+
+---
+
+## Context compression and token benchmark
+
+The loop's elision pass now has two tiers. When memory can attribute a stale
+`read_file` result to a file, the contents are replaced by that file's
+**current module summary** rather than a blank placeholder:
+
+```
+[compressed -- current summary of this file: app/controllers/note.controller.js
+[controllers] (169 lines) -- defines create, findAll, …; DB calls: find, …
+Re-read the file only if you need its exact contents.]
+```
+
+The system prompt tells the model these blocks are current and that it should
+re-read only when it needs exact text to edit. Results memory cannot
+attribute fall back to the generic notice.
+
+### Benchmark
+
+Replaying a 12-call run (the real read/write/verify sequence against the notes
+app, real file contents, 13 requests, ~4 chars/token):
+
+| Policy | Total sent | Peak request |
+| --- | --- | --- |
+| A — no elision, no intel (naive) | ~62,900 tok | ~8,200 tok |
+| B — generic elision, no intel | ~41,900 tok | ~4,400 tok |
+| C — generic elision + intel block | ~51,300 tok | ~5,100 tok |
+| D — **summary compression + graph** | ~52,900 tok | ~5,400 tok |
+
+**Read this honestly.** Against the naive baseline the current design sends
+**16% fewer total tokens and a 34% smaller peak request** — and peak is what
+413s an 8k-TPM tier. But against policy B, the pre-intelligence design, D is
+**26% larger**: the intelligence block, graph, and summaries are real tokens
+that a blank placeholder does not spend.
+
+What that buys is fewer *turns*. Live runs on the notes app went from 20 turns
+/ 82k prompt tokens (no intel) to 11 turns / 42–48k across three separate
+tasks, because the agent stops spending its opening turns rediscovering
+layout. The per-request overhead is paid back several times over by the
+requests never made — but on a repo where the agent would only ever open one
+file, policy B would genuinely be cheaper. `--no-intel` gives you that.
 
 ---
 
@@ -716,9 +824,12 @@ range, where "which file handles billing?" stops being greppable.
 **Read-before-write is instructed, not enforced.** The prompt requires it;
 nothing in the harness blocks a `write_file` on an unread path.
 
-**History is elided, not summarised.** Cheap and lossless-by-reference — the
-agent can re-read — but it does cause repeat reads. Real compaction would
-summarise instead.
+**History is compressed to deterministic summaries, not model-written ones.**
+An old file read collapses to a generated one-liner (exports, routes,
+imports, DB calls) that is free, instant, and always current. It is not a
+semantic summary — it will not tell the model *why* a function exists, only
+what the file contains. An LLM-written summary would say more and cost an
+extra call per file.
 
 **Git is untouched.** No branch, no commit, no rollback. Review with `git diff`
 and revert by hand.
@@ -743,6 +854,13 @@ and revert by hand.
   (multi-line signatures, dynamic route registration, computed exports) are
   missed; JS/TS and Python are indexed, other languages get detection only.
   The scan caps at 2,000 files.
+- **Call edges are attributed by body span**, meaning a function is assumed to
+  run from its definition line to the next definition in the same file. That
+  fits flat controller-style modules; deeply nested closures will misattribute.
+  Route wiring only resolves `app.get('/x', mod.handler)` shapes — routers
+  built dynamically are missed.
+- **Memory is per-run, not persistent.** Nothing is cached between
+  invocations; every run re-scans from scratch.
 - **Tested on one repository.** Behaviour on larger or differently structured
   Express projects is unmeasured.
 
@@ -755,7 +873,9 @@ converseai/
 ├── main.py              CLI entry point
 ├── agent/
 │   ├── __init__.py
+│   ├── graph.py         Knowledge graph: imports, routes, calls, DB edges
 │   ├── intel.py         Repository Intelligence Engine (pre-scan, no LLM)
+│   ├── memory.py        Repository memory + module summaries (compression)
 │   ├── llm.py           Groq client wrapper — one request, one response
 │   ├── loop.py          Turn loop, retries, context elision, console output
 │   ├── prompts.py       System prompt (five phases) and the opening message

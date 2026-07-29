@@ -541,6 +541,40 @@ def _detect_entry_points(intel: RepoIntelligence, root: Path, rels: list[str]) -
     intel.entry_points = entries
 
 
+def reindex_file(intel: RepoIntelligence, root: str | Path, rel: str) -> None:
+    """Refresh one file's symbols and endpoints after it changed on disk.
+
+    Used by `agent.memory` when the agent writes a file mid-run, so the
+    intelligence object keeps describing the repository as it now is rather
+    than as it was at scan time.
+
+    Args:
+        intel: The object to update in place.
+        root: Repository root.
+        rel: Repo-relative path (forward slashes) of the changed file.
+    """
+    root = Path(root).expanduser().resolve()
+    intel.symbols = [s for s in intel.symbols if s.file != rel]
+    intel.endpoints = [e for e in intel.endpoints if e.file != rel]
+
+    path = root / rel
+    suffix = path.suffix.lower()
+    text = _read(path) if path.is_file() else ""
+    if text:
+        if suffix in (".js", ".mjs", ".cjs", ".ts", ".jsx", ".tsx"):
+            _index_js(intel, rel, text)
+        elif suffix == ".py":
+            _index_py(intel, rel, text)
+
+    seen: set[str] = set()
+    unique: list[Symbol] = []
+    for ep in intel.endpoints:
+        if ep.detail not in seen:
+            seen.add(ep.detail)
+            unique.append(ep)
+    intel.endpoints = unique
+
+
 # ----------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------

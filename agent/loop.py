@@ -23,7 +23,7 @@ from typing import Any
 
 import groq
 
-from agent import intel as repo_intel
+from agent import memory as repo_memory
 from agent.llm import LLM
 from agent.prompts import SUMMARY_MARKER, build_system_prompt, build_task_message
 from agent.tools import TOOLS, dispatch, set_repo_root
@@ -180,15 +180,19 @@ def run(
     llm = llm or LLM()
     system = build_system_prompt(extra_instructions)
 
-    intelligence = None
+    mem = None
     intel_block = None
     if use_intel:
         # A scan failure must never kill the run; exploration still works
         # the old way without it.
         try:
-            intelligence = repo_intel.analyze(repo)
-            intel_block = intelligence.render()
+            mem = repo_memory.build_memory(repo)
+            intel_block = mem.intel.render()
+            graph_block = mem.render_block()
+            if graph_block:
+                intel_block += "\n" + graph_block
         except Exception as exc:  # noqa: BLE001 - degrade, don't die
+            mem = None
             _say(f"  {_BAD} repo intelligence scan failed ({exc}); continuing without it")
 
     messages: list[dict[str, Any]] = [
@@ -199,14 +203,16 @@ def run(
     _say(f"  converseai  {_ARROW}  groq / {llm.model}  (temp={llm.temperature})")
     _say(f"  repo: {repo}")
     _say(f"  task: {_clip(_flatten(task), 60)}")
-    if intelligence:
+    if mem:
+        graph_edges = len(mem.graph.edges)
         _say(
-            f"  intel: {intelligence.primary_language} / "
-            f"{', '.join(intelligence.frameworks) or 'no framework'} / "
-            f"{intelligence.architecture} -- "
-            f"{intelligence.files_scanned} files, "
-            f"{len(intelligence.symbols)} symbols, "
-            f"{len(intelligence.endpoints)} endpoints"
+            f"  intel: {mem.intel.primary_language} / "
+            f"{', '.join(mem.intel.frameworks) or 'no framework'} / "
+            f"{mem.intel.architecture} -- "
+            f"{mem.intel.files_scanned} files, "
+            f"{len(mem.intel.symbols)} symbols, "
+            f"{len(mem.intel.endpoints)} endpoints, "
+            f"{graph_edges} graph edges"
         )
     _say(_rule())
 
@@ -219,7 +225,7 @@ def run(
         # Header first, so a slow call or a retry notice lands under the turn
         # it belongs to rather than above it.
         _say(f"\n[turn {turn}/{max_turns}]")
-        response = _complete_with_retry(llm, messages, system)
+        response = _complete_with_retry(llm, messages, system, mem)
 
         choice = response.choices[0]
         message = choice.message
@@ -249,11 +255,13 @@ def run(
                 continue
 
             _log_summary(final)
+            if mem:
+                _say(f"  memory: {mem.stats_line()}")
             _log_footer(time.monotonic() - started, turn, tool_calls, tokens_in, tokens_out)
             return final
 
         _log_text((message.content or "").strip())
-        results = _handle_tool_calls(message)
+        results = _handle_tool_calls(message, mem)
         tool_calls += len(results)
         messages.extend(results)
 
@@ -268,7 +276,7 @@ def run(
 
 
 def _complete_with_retry(
-    llm: LLM, messages: list[dict[str, Any]], system: str
+    llm: LLM, messages: list[dict[str, Any]], system: str, mem: Any = None
 ) -> Any:
     """Call the model, retrying once on a transient failure.
 
@@ -287,7 +295,7 @@ def _complete_with_retry(
     Raises:
         groq.APIError: If the final attempt fails.
     """
-    payload = _elide_old_results(messages)
+    payload = _elide_old_results(messages, mem)
 
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
@@ -319,8 +327,16 @@ def _complete_with_retry(
     raise AssertionError("unreachable")  # pragma: no cover
 
 
-def _elide_old_results(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return a copy of ``messages`` with stale tool results shortened.
+def _elide_old_results(
+    messages: list[dict[str, Any]], mem: Any = None
+) -> list[dict[str, Any]]:
+    """Return a copy of ``messages`` with stale tool results compressed.
+
+    Two tiers. When repository memory knows which file an old ``read_file``
+    result showed, the full contents are replaced with that file's *current
+    module summary* -- the model keeps a compressed understanding (exports,
+    routes, imports, DB calls) instead of a blank. Anything memory cannot
+    attribute falls back to the generic elision notice.
 
     Only the *content* is replaced, never the message itself: every
     ``role: "tool"`` entry has to keep its ``tool_call_id`` so it still
@@ -328,6 +344,7 @@ def _elide_old_results(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     Args:
         messages: The live history. Not mutated.
+        mem: `agent.memory.RepositoryMemory`, or None for generic elision.
 
     Returns:
         A shallow copy safe to send as the request payload.
@@ -344,7 +361,22 @@ def _elide_old_results(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             and i not in recent
             and len(entry.get("content") or "") > ELIDE_OVER_CHARS
         )
-        trimmed.append({**entry, "content": ELIDED} if stale else entry)
+        if not stale:
+            trimmed.append(entry)
+            continue
+
+        replacement = ELIDED
+        if mem:
+            call_id = entry.get("tool_call_id", "")
+            path = mem.tool_call_file.get(call_id)
+            summary = mem.summary_for(path) if path else None
+            if summary:
+                replacement = (
+                    f"[compressed -- current summary of this file: {summary}. "
+                    "Re-read the file only if you need its exact contents.]"
+                )
+                mem.compressed_ids.add(call_id)
+        trimmed.append({**entry, "content": replacement})
     return trimmed
 
 
@@ -404,7 +436,7 @@ def _assistant_message(message: Any) -> dict[str, Any]:
     return entry
 
 
-def _handle_tool_calls(message: Any) -> list[dict[str, Any]]:
+def _handle_tool_calls(message: Any, mem: Any = None) -> list[dict[str, Any]]:
     """Execute every tool call on an assistant message, narrating as it goes.
 
     Tools are already bound to the repo root by `agent.tools.set_repo_root`,
@@ -412,6 +444,8 @@ def _handle_tool_calls(message: Any) -> list[dict[str, Any]]:
 
     Args:
         message: ``response.choices[0].message``, with ``tool_calls`` set.
+        mem: `agent.memory.RepositoryMemory` to notify of reads and writes,
+            or None when running without the pre-scan.
 
     Returns:
         One ``role: "tool"`` message per call, in order, each carrying the
@@ -450,15 +484,41 @@ def _handle_tool_calls(message: Any) -> list[dict[str, Any]]:
         result = dispatch(name, arguments)
         elapsed = time.monotonic() - started
 
-        marker = _BAD if result.startswith("Error:") else _OK
+        failed = result.startswith("Error:")
+        marker = _BAD if failed else _OK
         timing = f"  ({elapsed:.1f}s)" if elapsed >= 0.5 else ""
         _say(f"    {marker} {_format_result(result)}{timing}")
+
+        # Feed repository memory, so summaries stay current and old results
+        # can later be compressed to summaries instead of blanks.
+        if mem and not failed and isinstance(arguments, dict):
+            path = _normalise_path(mem, arguments.get("path", ""))
+            try:
+                if name == "read_file" and path:
+                    mem.record_read(path, call.id)
+                elif name == "write_file" and path:
+                    mem.record_write(path, call.id)
+            except Exception as exc:  # noqa: BLE001 - memory must not kill a run
+                _say(f"    {_BAD} memory update failed ({exc}); continuing")
 
         results.append(
             {"role": "tool", "tool_call_id": call.id, "content": result}
         )
 
     return results
+
+
+def _normalise_path(mem: Any, path: str) -> str:
+    """Repo-relative forward-slash form of a tool-call path."""
+    if not path:
+        return ""
+    try:
+        p = Path(path)
+        if p.is_absolute():
+            p = p.relative_to(mem.root)
+        return p.as_posix()
+    except (ValueError, OSError):
+        return path.replace("\\", "/")
 
 
 def _log_reasoning(message: Any) -> None:
