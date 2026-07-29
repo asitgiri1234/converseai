@@ -62,9 +62,14 @@ touches, using the symbol index to find them.
 - When the block is absent, start with list_files, then read package.json \
 first: it tells you the entry point, the scripts available to you, the \
 dependencies you may use, and whether the project is CommonJS or ESM.
+- To locate behaviour, ask search_repo a plain question -- "where are notes \
+created?", "which endpoint deletes a note?", "which controller uses this \
+model?". It answers from the indexed structure with file:line locations and \
+ranks by relevance. If it reports no matches, the repository does not \
+contain that; do not invent it.
 - Either way, read the actual files you plan to modify before planning \
-edits to them, and use search_code to confirm how an existing pattern is \
-written (error handling, response shape, async style) when you are unsure.
+edits to them, and use search_code when you need a literal string or an \
+exact regex (a specific error message, a precise identifier).
 - Do not guess at file paths or file contents.
 
 === 2. PLAN ===

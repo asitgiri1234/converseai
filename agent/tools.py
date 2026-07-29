@@ -342,6 +342,45 @@ def write_file(path: str, content: str) -> str:
     return f"{verb} {_rel(target)} ({len(content.splitlines())} lines, {len(content)} bytes)."
 
 
+_search_memory = None  # RepositoryMemory, injected by the loop or built lazily
+
+
+def set_search_index(memory) -> None:
+    """Give the search tool a prebuilt repository memory.
+
+    `agent.loop` calls this so ``search_repo`` reuses the scan the run already
+    paid for, and sees files the agent has written this run.
+
+    Args:
+        memory: An `agent.memory.RepositoryMemory`, or None to clear.
+    """
+    global _search_memory
+    _search_memory = memory
+
+
+def search_repo(question: str) -> str:
+    """Answer a question about the repository semantically.
+
+    Args:
+        question: A natural-language question, e.g. "which endpoint deletes a
+            note?".
+
+    Returns:
+        Ranked results with locations and the evidence behind each match, or
+        a clear statement that nothing matched.
+    """
+    # Imported here to keep module import cheap and avoid a cycle at load.
+    from agent import memory as repo_memory
+    from agent import search as repo_search
+
+    global _search_memory
+    if _search_memory is None:
+        _search_memory = repo_memory.build_memory(get_repo_root())
+
+    hits = repo_search.search(question, _search_memory)
+    return repo_search.render(question, hits)
+
+
 def _check_command(command: str) -> None:
     """Refuse obviously destructive shell commands.
 
@@ -552,6 +591,27 @@ TOOLS: list[dict[str, Any]] = [
         ["pattern"],
     ),
     _function(
+        "search_repo",
+        "Ask a question about this repository in plain English and get "
+        "ranked, located answers -- for example 'where are notes created?', "
+        "'which endpoint deletes a note?', 'which controller uses this "
+        "model?', or 'which functions write to the database?'. Prefer this "
+        "over search_code when you want to find WHERE something happens; use "
+        "search_code when you need a literal string or a precise regex. If "
+        "it reports no matches, the repository genuinely does not appear to "
+        "contain that -- do not assume otherwise.",
+        {
+            "question": {
+                "type": "string",
+                "description": (
+                    "A natural-language question about the codebase, e.g. "
+                    "'which controller handles note updates?'"
+                ),
+            }
+        },
+        ["question"],
+    ),
+    _function(
         "write_file",
         "Create a file or overwrite it completely, creating parent "
         "directories as needed. The content you supply replaces the whole "
@@ -588,6 +648,7 @@ _IMPLEMENTATIONS: dict[str, Callable[..., str]] = {
     "list_files": list_files,
     "read_file": read_file,
     "search_code": search_code,
+    "search_repo": search_repo,
     "write_file": write_file,
     "run_shell": run_shell,
 }

@@ -23,6 +23,7 @@ narrated to the terminal as it happens.
 - [Knowledge graph and repository memory](#knowledge-graph-and-repository-memory)
 - [Context compression and token benchmark](#context-compression-and-token-benchmark)
 - [How repository exploration works](#how-repository-exploration-works)
+- [Semantic search](#semantic-search)
 - [Tool reference](#tool-reference)
 - [Message formats](#message-formats)
 - [Safety model](#safety-model)
@@ -167,6 +168,7 @@ replays it every turn.
 | `main.py` | Argument parsing, `--repo` validation, binding the tool root, exit codes | Know anything about turns or tools |
 | `agent/intel.py` | The pre-scan: architecture detection, file roles, symbol index, rendering | Call the LLM, the network, or mutate anything |
 | `agent/graph.py` | Relationships: imports, route wiring, call edges, DB touchpoints | Read the filesystem twice — it works from the scan |
+| `agent/search.py` | Question intent, multi-signal ranking, evidence strings | Call a model or an embedding service |
 | `agent/memory.py` | Module summaries, explored files, discovered APIs, compression source | Decide when to compress — the loop asks it |
 | `agent/llm.py` | Client construction, model defaults, one request/response | Loop, retry, or interpret the response |
 | `agent/prompts.py` | The stable system prompt and the opening user message | Know about tools or the API |
@@ -486,6 +488,97 @@ That mode remains the fallback whenever the scan fails or the flag is set.
 
 ---
 
+## Semantic search
+
+`agent/search.py` answers questions instead of matching patterns:
+
+```bash
+python -m agent.search ./target-repo "which endpoint deletes a note?"
+```
+
+```
+SEMANTIC SEARCH: which endpoint deletes a note?
+  interpreted as: action=delete, looking for=route, about=note
+  1. [route] DELETE /notes/:noteId -> app/controllers/note.controller.js::delete
+        (app/routes/note.routes.js:17)  score 12.5
+      why: HTTP DELETE matches 'delete'; path mentions note; question asks for an endpoint
+  2. [symbol] delete [export]  (app/controllers/note.controller.js:97)  score 12.5
+      why: name 'delete' means delete; path mentions note; calls findByIdAndRemove
+```
+
+### Why not embeddings
+
+Groq serves **no embedding model** — the account exposes `client.embeddings`
+but the model list contains none, so there is nothing to call. The
+alternative is a local encoder, which means torch plus a model download:
+roughly 2 GB against a project whose entire dependency list is `groq` and
+`python-dotenv`.
+
+So this is *structural* semantic search. It parses the question's intent and
+resolves it against facts already extracted by the intelligence scan and the
+knowledge graph — routes, handlers, exports, imports, database calls, file
+roles. That trades open-vocabulary recall for precision on the vocabulary a
+web codebase actually uses, and it costs no tokens, no network, and no
+dependency.
+
+### The six capabilities
+
+| Capability | How it works |
+| --- | --- |
+| Structural | File roles and architecture from the scan drive matches |
+| Symbol-aware | Exports, functions, classes and models, each with `file:line` |
+| Route-aware | The verb in the question maps to an HTTP method: *deletes* → `DELETE` |
+| Controller-aware | Routes resolve through the graph's `registers` edges to their handler symbol |
+| Model-aware | "which controller uses this model" walks `importers_of` and filters by role |
+| Ranked | Multi-signal scores, each hit carrying the evidence that produced it |
+
+### How ranking works
+
+Intent parsing splits the question into **actions** (create/read/update/
+delete, with synonyms and third-person forms — *creates*, *deletes*),
+**artifacts** (route, controller, model, service, middleware, config,
+function), **concepts** (authentication, database, validation, error
+handling, logging, pagination), and **entities** — whatever domain nouns are
+left over.
+
+Scoring then combines named, tunable signals: HTTP-method match (6.0), graph
+relation (7.0), exact name match (6.0), action-in-name (5.0), database method
+match (5.5), role match (4.0), fuzzy name via stdlib `difflib` (3.0), and
+path/summary token overlap. A symbol that matches the question's *subject*
+but not its *verb* is penalised — a `Note` model is not the answer to "where
+are notes created", the `create` handler is.
+
+### `search_repo` vs `search_code`
+
+Both are available; they answer different questions.
+
+| | `search_repo` | `search_code` |
+| --- | --- | --- |
+| Input | Plain-English question | Regex |
+| Answers | *Where does X happen?* | *Where does this string appear?* |
+| Output | Ranked hits with evidence | `file:line:match` |
+| Use when | Locating behaviour | You need a literal string or exact pattern |
+
+The tool reuses the run's existing scan (the loop injects it via
+`set_search_index`, so it also sees files written during the run) and builds
+its own lazily when used standalone.
+
+### It says "no" when the answer is no
+
+Asked *"where is authentication implemented?"* against the notes app — which
+has no auth — it returns:
+
+```
+  No matches. This repository does not appear to contain that -- do not
+  assume it exists; use search_code for a literal string.
+```
+
+That wording is deliberate. A search tool that always returns its least-bad
+match teaches the model to hallucinate a subsystem; the same query for *error
+handling*, which the app does implement, correctly returns the controller.
+
+---
+
 ## Tool reference
 
 Tools are declared in OpenAI function format — Groq speaks the OpenAI
@@ -497,6 +590,7 @@ which **always returns a string and never raises**.
 | `list_files` | `path` (optional) | Indented recursive tree, directories before files | Skips `node_modules` and `.git`; 1,000 entries; won't follow symlinked dirs |
 | `read_file` | `path` | Contents with line numbers | 500 lines; refuses binaries (NUL-byte check) |
 | `search_code` | `pattern` | Regex across all text files → `file:line:match` | 50 results; skips binaries and files > 2 MB; match lines clipped to 200 chars |
+| `search_repo` | `question` | Plain-English question → ranked hits with locations and evidence, see [Semantic search](#semantic-search) | 8 hits; returns nothing rather than a weak guess |
 | `write_file` | `path`, `content` | Create or overwrite, creating parent directories | Reports created-vs-overwrote plus line and byte counts |
 | `run_shell` | `command` | Runs via the platform shell with `cwd` = repo root | 30 s timeout; output capped at 20,000 chars; returns exit code + stdout + stderr |
 
@@ -953,6 +1047,19 @@ and revert by hand.
   built dynamically are missed.
 - **Memory is per-run, not persistent.** Nothing is cached between
   invocations; every run re-scans from scratch.
+- **Semantic search is vocabulary-bound, not embedding-based.** It knows the
+  words in its action, artifact, and concept tables plus whatever the code
+  names itself. A question phrased entirely outside that vocabulary
+  ("where does the system fan out work?") will find nothing, where an
+  embedding model might. Extending it means adding words to
+  `ACTIONS`/`CONCEPTS` in `agent/search.py`, not retraining anything.
+- **`search_repo` is verified offline but not yet inside a completed live
+  run.** Its engine, ranking, and tool dispatch are covered by tests, and a
+  live model did choose it with a sensible question — but that run failed on
+  Groq's tool-call serialisation (`<function=search_repo {...}</function>`
+  instead of JSON) and the daily token budget ran out before a clean
+  end-to-end demonstration. The temperature-varied resample added in
+  response is likewise untested live.
 - **Tested on one repository.** Behaviour on larger or differently structured
   Express projects is unmeasured.
 
@@ -968,6 +1075,7 @@ converseai/
 │   ├── graph.py         Knowledge graph: imports, routes, calls, DB edges
 │   ├── intel.py         Repository Intelligence Engine (pre-scan, no LLM)
 │   ├── memory.py        Repository memory + module summaries (compression)
+│   ├── search.py        Semantic search: intent parsing, ranking, evidence
 │   ├── llm.py           Groq client wrapper — one request, one response
 │   ├── loop.py          Turn loop, retries, context elision, console output
 │   ├── prompts.py       System prompt (five phases) and the opening message

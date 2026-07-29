@@ -34,7 +34,7 @@ from agent.prompts import (
     build_task_message,
     missing_plan_sections,
 )
-from agent.tools import TOOLS, dispatch, set_repo_root
+from agent.tools import TOOLS, dispatch, set_repo_root, set_search_index
 
 # Safety valve: stop after this many model turns even if the agent is still
 # asking for tools, so a confused run can't spin forever.
@@ -205,11 +205,16 @@ def run(
 
     mem = None
     intel_block = None
+    # Clear any index left by a previous run in the same process.
+    set_search_index(None)
     if use_intel:
         # A scan failure must never kill the run; exploration still works
         # the old way without it.
         try:
             mem = repo_memory.build_memory(repo)
+            # search_repo reuses this scan instead of paying for its own, and
+            # so reflects files the agent writes during the run.
+            set_search_index(mem)
             intel_block = mem.intel.render()
             graph_block = mem.render_block()
             if graph_block:
@@ -341,10 +346,14 @@ def _complete_with_retry(
         groq.APIError: If the final attempt fails.
     """
     payload = _elide_old_results(messages, mem)
+    resample_temp: float | None = None
 
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
-            return llm.complete(messages=payload, tools=TOOLS, system=system)
+            return llm.complete(
+                messages=payload, tools=TOOLS, system=system,
+                temperature=resample_temp,
+            )
         except (
             groq.APIConnectionError,
             groq.RateLimitError,
@@ -363,7 +372,13 @@ def _complete_with_retry(
             if "tool_use_failed" not in str(exc) or attempt == RETRY_ATTEMPTS:
                 _say(f"  {_BAD} API error {exc.status_code}: {exc.message}")
                 raise
-            _say(f"  {_BAD} model emitted malformed tool-call JSON; resampling")
+            # Resampling at the same temperature tends to reproduce the same
+            # malformed output, so nudge it up to break the pattern.
+            resample_temp = min(0.8, (llm.temperature or 0.0) + 0.35 * attempt)
+            _say(
+                f"  {_BAD} model emitted malformed tool-call JSON; "
+                f"resampling at temp {resample_temp:.2f}"
+            )
             time.sleep(RETRY_BASE_DELAY)
         except groq.APIStatusError as exc:
             _say(f"  {_BAD} API error {exc.status_code}: {exc.message}")
