@@ -23,6 +23,7 @@ from typing import Any
 
 import groq
 
+from agent import intel as repo_intel
 from agent.llm import LLM
 from agent.prompts import SUMMARY_MARKER, build_system_prompt, build_task_message
 from agent.tools import TOOLS, dispatch, set_repo_root
@@ -51,8 +52,11 @@ MAX_TEXT_LINES = 16
 # File contents dominate an agent's history: one 120-line file read twice is
 # most of a small tier's per-minute budget. Older tool results are elided from
 # the *request* (history itself is kept intact) so a long run stays under the
-# limit. The elision is worded so the model knows it can re-read.
-KEEP_TOOL_RESULTS = 4
+# limit. The elision is worded so the model knows it can re-read. Three keeps
+# the latest read of the file being edited plus its immediate context; four
+# was measured to let two full copies of one controller ride along and 413
+# an 8k-TPM tier.
+KEEP_TOOL_RESULTS = 3
 ELIDE_OVER_CHARS = 400
 ELIDED = "[earlier result elided to save context -- re-read the file if you still need it]"
 
@@ -146,6 +150,7 @@ def run(
     llm: LLM | None = None,
     max_turns: int = MAX_TURNS,
     extra_instructions: str | None = None,
+    use_intel: bool = True,
 ) -> str:
     """Run the agent against a repository until the task is done.
 
@@ -158,6 +163,10 @@ def run(
         max_turns: Hard cap on model turns before giving up.
         extra_instructions: Project-specific rules appended to the system
             prompt.
+        use_intel: Pre-scan the repository with `agent.intel` and embed the
+            summary in the first message. Costs zero API tokens to build;
+            disable (--no-intel) to fall back to pure tool-driven
+            exploration.
 
     Returns:
         The agent's final text response.
@@ -170,14 +179,35 @@ def run(
     set_repo_root(repo)
     llm = llm or LLM()
     system = build_system_prompt(extra_instructions)
+
+    intelligence = None
+    intel_block = None
+    if use_intel:
+        # A scan failure must never kill the run; exploration still works
+        # the old way without it.
+        try:
+            intelligence = repo_intel.analyze(repo)
+            intel_block = intelligence.render()
+        except Exception as exc:  # noqa: BLE001 - degrade, don't die
+            _say(f"  {_BAD} repo intelligence scan failed ({exc}); continuing without it")
+
     messages: list[dict[str, Any]] = [
-        {"role": "user", "content": build_task_message(repo, task)}
+        {"role": "user", "content": build_task_message(repo, task, intel_block)}
     ]
 
     _say(_rule())
     _say(f"  converseai  {_ARROW}  groq / {llm.model}  (temp={llm.temperature})")
     _say(f"  repo: {repo}")
     _say(f"  task: {_clip(_flatten(task), 60)}")
+    if intelligence:
+        _say(
+            f"  intel: {intelligence.primary_language} / "
+            f"{', '.join(intelligence.frameworks) or 'no framework'} / "
+            f"{intelligence.architecture} -- "
+            f"{intelligence.files_scanned} files, "
+            f"{len(intelligence.symbols)} symbols, "
+            f"{len(intelligence.endpoints)} endpoints"
+        )
     _say(_rule())
 
     started = time.monotonic()

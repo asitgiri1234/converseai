@@ -34,16 +34,21 @@ editing before you have explored and planned.
 
 === 1. EXPLORE ===
 Understand the codebase before you touch it.
-- Start with list_files to see the layout.
-- Read package.json first: it tells you the entry point, the scripts \
-available to you, the dependencies you may use, and whether the project is \
-CommonJS (require) or ESM (import).
-- Read the route definitions, the Mongoose models, and the controllers or \
-handlers that sit between them. Follow the path a request actually takes.
-- Use search_code to find where a pattern is already established -- how \
-routes are registered, how errors are handled, how responses are shaped, how \
-async is written (callbacks vs promises vs async/await).
-- Do not guess at file paths or file contents. Read them.
+- Your first message may include a REPOSITORY INTELLIGENCE block: a \
+pre-scanned summary of the language, framework, architecture, entry points, \
+file roles, API endpoints, and a symbol index with file:line locations. \
+Treat it as a map, not as ground truth -- it was produced by heuristics, \
+not by reading every line.
+- When the block is present, do not re-list or re-read files just to \
+discover the layout; go straight to reading the specific files your task \
+touches, using the symbol index to find them.
+- When the block is absent, start with list_files, then read package.json \
+first: it tells you the entry point, the scripts available to you, the \
+dependencies you may use, and whether the project is CommonJS or ESM.
+- Either way, read the actual files you plan to modify before planning \
+edits to them, and use search_code to confirm how an existing pattern is \
+written (error handling, response shape, async style) when you are unsure.
+- Do not guess at file paths or file contents.
 
 === 2. PLAN ===
 Before your first edit, output a plan as plain text beginning with "PLAN:".
@@ -130,20 +135,40 @@ def build_system_prompt(extra_instructions: str | None = None) -> str:
     )
 
 
-def build_task_message(repo: Path, task: str) -> str:
+def build_task_message(repo: Path, task: str, intel_block: str | None = None) -> str:
     """Build the opening user message for a run.
+
+    The intelligence block rides here rather than in the system prompt for
+    two reasons: the system prompt must stay byte-identical across runs, and
+    the first user message is never elided by the loop's context trimming --
+    so the summary stays visible to the PLAN, IMPLEMENT, and VERIFY phases
+    alike.
 
     Args:
         repo: Repository root, named so the agent knows where it is working.
         task: The product request, verbatim.
+        intel_block: Rendered `agent.intel.RepoIntelligence`, or None to run
+            without a pre-scan (the prompt's EXPLORE fallback covers this).
 
     Returns:
         The text of the first user message.
     """
-    return (
+    parts = [
         f"Repository root: {repo}\n"
-        "All tool paths are relative to that root.\n\n"
-        f"Product request:\n{task.strip()}\n\n"
-        "Begin with EXPLORE. Do not edit anything before you have emitted "
-        'your "PLAN:".'
-    )
+        "All tool paths are relative to that root.",
+    ]
+    if intel_block:
+        parts.append(intel_block)
+        parts.append(
+            f"Product request:\n{task.strip()}\n\n"
+            "The intelligence block above already maps the repository: plan "
+            "from it, then read only the files your plan touches. Do not "
+            'edit anything before you have emitted your "PLAN:".'
+        )
+    else:
+        parts.append(
+            f"Product request:\n{task.strip()}\n\n"
+            "Begin with EXPLORE. Do not edit anything before you have "
+            'emitted your "PLAN:".'
+        )
+    return "\n\n".join(parts)

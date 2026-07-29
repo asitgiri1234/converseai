@@ -55,6 +55,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=MAX_TURNS,
         help=f"Stop after this many model turns. Default: {MAX_TURNS}.",
     )
+    parser.add_argument(
+        "--no-intel",
+        action="store_true",
+        help=(
+            "Skip the repository pre-scan and let the agent explore with "
+            "tools only."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -77,7 +85,13 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        run(repo, args.task, llm=llm, max_turns=args.max_turns)
+        run(
+            repo,
+            args.task,
+            llm=llm,
+            max_turns=args.max_turns,
+            use_intel=not args.no_intel,
+        )
     except RuntimeError as exc:
         # The loop already printed the detail; this is just the exit code.
         print(f"error: {exc}", file=sys.stderr)

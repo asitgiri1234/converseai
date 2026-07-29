@@ -18,6 +18,7 @@ narrated to the terminal as it happens.
 - [Configuration](#configuration)
 - [Architecture](#architecture)
 - [The agent workflow](#the-agent-workflow)
+- [Repository Intelligence Engine](#repository-intelligence-engine)
 - [How repository exploration works](#how-repository-exploration-works)
 - [Tool reference](#tool-reference)
 - [Message formats](#message-formats)
@@ -86,6 +87,7 @@ python main.py --repo PATH --task TEXT [--model ID] [--temperature F] [--max-tur
 | `--model` | no | `$GROQ_MODEL`, else `llama-3.3-70b-versatile` | Any Groq model with tool-calling support. |
 | `--temperature` | no | `0.2` | Sampling temperature. Low suits a coding agent. |
 | `--max-turns` | no | `40` | Hard cap on model turns before the run aborts. |
+| `--no-intel` | no | off | Skip the repository pre-scan; explore with tools only. |
 
 **Exit codes**
 
@@ -136,8 +138,11 @@ replays it every turn.
      │
      ▼
   agent/loop.py ───────────────────────────────────────────┐
-     │  history: [user task, assistant, tool results, …]   │
+     │  history: [user task + intel, assistant, tools, …]  │
      │                                                     │
+     ├──▶ agent/intel.py      one deterministic pre-scan   │
+     │      (no LLM calls)     → RepoIntelligence object   │
+     │                          rendered into first message │
      ├──▶ agent/prompts.py    system prompt (phases, rules)│
      │                                                     │
      ├──▶ agent/llm.py ──────▶ Groq chat completions       │
@@ -154,6 +159,7 @@ replays it every turn.
 | Module | Owns | Deliberately does *not* |
 | --- | --- | --- |
 | `main.py` | Argument parsing, `--repo` validation, binding the tool root, exit codes | Know anything about turns or tools |
+| `agent/intel.py` | The pre-scan: architecture detection, file roles, symbol index, rendering | Call the LLM, the network, or mutate anything |
 | `agent/llm.py` | Client construction, model defaults, one request/response | Loop, retry, or interpret the response |
 | `agent/prompts.py` | The stable system prompt and the opening user message | Know about tools or the API |
 | `agent/tools.py` | Tool schemas, filesystem/shell execution, path and command safety | Know that an LLM exists |
@@ -172,8 +178,8 @@ The system prompt drives five explicit phases.
 
 | Phase | What the agent does |
 | --- | --- |
-| **1. EXPLORE** | `list_files`, then `package.json` (entry point, scripts, deps, CommonJS vs ESM), then routes, models, controllers. Following `require()` chains rather than guessing at paths. |
-| **2. PLAN** | Emits a numbered `PLAN:` block — the feature chosen, every file it will touch with a reason, and any `Assumption:` — *before* the first edit. |
+| **1. EXPLORE** | With the intelligence block present: targeted reads of only the files the task touches, located via the symbol index. Without it: `list_files`, then `package.json`, then following `require()` chains. |
+| **2. PLAN** | Emits a numbered `PLAN:` block — the feature chosen, every file it will touch with a reason, and any `Assumption:` — *before* the first edit, informed by the intelligence summary. |
 | **3. IMPLEMENT** | `write_file`, preserving existing routes, exports, response shapes, and field names, matching the surrounding style. Additive and backwards-compatible. |
 | **4. VERIFY** | Re-reads every modified file, runs `node --check` on each changed file, runs `npm test` / `npm run lint` if they exist. |
 | **5. SUMMARIZE** | A `SUMMARY:` section listing every file changed and why. |
@@ -202,27 +208,86 @@ Renaming it in one file and not the other silently breaks termination.
 
 ---
 
+## Repository Intelligence Engine
+
+Before the first model turn, `agent/intel.py` runs **one deterministic scan**
+of the repository — pure Python, no LLM calls, no network, zero API tokens —
+and builds a `RepoIntelligence` object:
+
+| Capability | How it is detected |
+| --- | --- |
+| Primary language | File-extension counts (JS/TS, Python, Java, Go, Ruby, PHP, Rust, C#, Kotlin) |
+| Framework | Dependency signals — `express`, `next`, `@nestjs/core`, `fastapi`, `django`, `flask`, Spring Boot via `pom.xml`, … |
+| Architecture | Directory shape — `models+controllers+routes` → MVC, `services+repositories` → Layered, `features/modules` → Feature-based, `domain+application+infrastructure` → Clean |
+| Package manager | Manifest + lockfile — npm/yarn/pnpm, pip/poetry/uv, maven, gradle, go modules, cargo |
+| Database | Connection-string schemes in config files (`mongodb://`, `postgres://`, …) — which **beat** dependency guesses — else ORM implication |
+| ORM / ODM | Dependency signals — Mongoose, Sequelize, Prisma, TypeORM, SQLAlchemy, Peewee, … |
+| Entry points | `package.json` `main` + `scripts.start`, then conventional names (`server.js`, `manage.py`, `main.py`, …) |
+| File roles | Path/filename hints → models, controllers, routes, services, middleware, views, utilities, config |
+| API endpoints | `app.get('/path', …)` / `router.post(…)` in JS, `@app.get("/path")` decorators in Python — with `file:line` |
+| Symbol index | Functions, classes, exports, Mongoose models — regex-extracted, each with `file:line` |
+
+The object is **reusable**: `find_symbol(name)`, `symbols_in(file)`,
+`files_with_role(role)`, and `to_dict()` let later phases query it instead of
+re-scanning. Its `render()` output (compact, per-section caps, ~350 tokens for
+the notes app) is embedded in the **first user message** — deliberately, for
+two reasons: the system prompt must stay byte-identical across runs, and the
+first user message is never touched by history elision, so the map stays
+visible to PLAN, IMPLEMENT, and VERIFY alike.
+
+Run it standalone (free, no key needed):
+
+```bash
+python -m agent.intel ./target-repo          # human-readable summary
+python -m agent.intel ./target-repo --json   # full object as JSON
+```
+
+Output for the notes app:
+
+```
+REPOSITORY INTELLIGENCE (pre-scanned, heuristic -- verify before relying on it):
+- Language: JavaScript | all: JavaScript (5)
+- Framework: Express
+- Architecture: MVC (models / controllers / routes)
+- Package manager: npm
+- Database: MongoDB (connection string in config/database.config.js) | ORM/ODM: Mongoose
+- Entry points: server.js
+- API endpoints:
+    GET /notes/count  (app/routes/note.routes.js:11)
+    ...
+- Symbol index (name [kind] file:line):
+    count [export] app/controllers/note.controller.js:124
+    ...
+```
+
+**Honesty:** detection is heuristic. Symbols come from regexes, not an AST;
+JavaScript and Python are indexed well, other languages get language/manifest
+detection only. The block is labelled "pre-scanned, heuristic — verify" and
+the prompt tells the model to treat it as a map, not gospel. A scan failure
+never kills a run — the agent falls back to tool-driven exploration, and
+`--no-intel` forces that mode.
+
+---
+
 ## How repository exploration works
 
-Exploration is **tool-driven and LLM-decided**. There is no pre-indexing pass,
-no repo map built ahead of time, no embeddings, and no hardcoded traversal
-order. The agent gets five tools and a repo root, and picks its next move from
-what the last result told it.
+Exploration is **intelligence-first, tool-verified**. The pre-scan answers the
+questions the agent used to spend its opening turns discovering; the tools
+then verify the specific files the task touches. The LLM still decides every
+step — there is just a map in its hand now.
 
-A real trace against the notes app:
+Measured on the notes app (same model, comparable small-endpoint tasks):
 
-```
-list_files(".")                      → sees app/, config/, server.js
-read_file("package.json")            → main: server.js, deps: express, mongoose
-read_file("app/models/note.model.js")→ schema: title, content, timestamps
-read_file("app/controllers/…")       → five exports, promise chains, 4-space indent
-read_file("app/routes/note.routes.js")→ how routes are registered
-```
+| | Without intel | With intel |
+| --- | --- | --- |
+| First edit at turn | 8 | 4 |
+| `PLAN:` emitted at turn | 7 | 3 |
+| Opening discovery calls | `list_files`, `package.json`, model, controller, routes, `server.js` | controller, routes only |
+| Total turns / prompt tokens | 20 / 82,482 | 11 / 41,295 |
 
-Five calls, and it knows the module system, the conventions, and the request
-path. The trade-off is turn count: each step is a round trip, so exploring costs
-latency and tokens that a pre-built index would not. On a repo this size that is
-the right trade (see [Design trade-offs](#design-trade-offs)).
+With `--no-intel` the old behaviour returns: `list_files`, then
+`package.json`, then following `require()` chains — each step a round trip.
+That mode remains the fallback whenever the scan fails or the flag is set.
 
 ---
 
@@ -641,11 +706,12 @@ file size, risks truncation on large files, and invites gratuitous reformatting
 — all three were observed. A `str_replace`-style edit tool is the right call
 above a few hundred lines.
 
-**No vector indexing or embeddings.** The target is six source files;
-`list_files` plus one regex `search_code` finds anything in a call or two.
-Embedding a repo this size adds an indexing step, a dependency, and a staleness
-problem to solve a retrieval issue that does not exist. It starts paying off
-somewhere in the thousands-of-files range.
+**Deterministic pre-scan, not embeddings.** The Repository Intelligence Engine
+is regex-and-heuristic Python: free, instant, reproducible, and wrong in
+predictable ways. Vector indexing would add an embedding step, a dependency,
+and a staleness problem to solve a retrieval issue a six-file repo does not
+have — semantic search starts paying off somewhere in the thousands-of-files
+range, where "which file handles billing?" stops being greppable.
 
 **Read-before-write is instructed, not enforced.** The prompt requires it;
 nothing in the harness blocks a `write_file` on an unread path.
@@ -673,6 +739,10 @@ and revert by hand.
   once.
 - **The 40-turn cap is a blunt stop.** Hitting it leaves the repository in
   whatever half-edited state the agent reached.
+- **The symbol index is regex-based, not an AST.** Unusual code layouts
+  (multi-line signatures, dynamic route registration, computed exports) are
+  missed; JS/TS and Python are indexed, other languages get detection only.
+  The scan caps at 2,000 files.
 - **Tested on one repository.** Behaviour on larger or differently structured
   Express projects is unmeasured.
 
@@ -685,6 +755,7 @@ converseai/
 ├── main.py              CLI entry point
 ├── agent/
 │   ├── __init__.py
+│   ├── intel.py         Repository Intelligence Engine (pre-scan, no LLM)
 │   ├── llm.py           Groq client wrapper — one request, one response
 │   ├── loop.py          Turn loop, retries, context elision, console output
 │   ├── prompts.py       System prompt (five phases) and the opening message
