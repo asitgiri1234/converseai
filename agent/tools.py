@@ -313,12 +313,94 @@ def search_code(pattern: str) -> str:
     return out
 
 
-def write_file(path: str, content: str) -> str:
-    """Create or overwrite a file, creating parent directories as needed.
+def edit_file(path: str, old_text: str, new_text: str) -> str:
+    """Replace one region of a file, leaving the rest byte-identical.
+
+    Args:
+        path: Repo-relative file to edit.
+        old_text: Existing text to replace. Must appear exactly once.
+        new_text: Its replacement. Empty string deletes the region.
+
+    Returns:
+        A report with the resulting diff, or an actionable error message.
+    """
+    from agent import patch as patcher
+
+    try:
+        target = _resolve(path)
+    except PathEscapeError as exc:
+        return f"Error: {exc}"
+    if not target.is_file():
+        return f"Error: no such file: {path} (use write_file to create it)"
+
+    try:
+        before = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return f"Error: could not read {path}: {exc}"
+
+    try:
+        result = patcher.apply_patch(before, old_text, new_text, path)
+    except patcher.PatchError as exc:
+        return f"Error: {exc}"
+
+    try:
+        target.write_text(result.text, encoding="utf-8")
+    except OSError as exc:
+        return f"Error: could not write {path}: {exc}"
+
+    return patcher.summarise(result, path)
+
+
+def insert_after(path: str, anchor: str, text: str) -> str:
+    """Insert text immediately after an existing anchor in a file.
+
+    Args:
+        path: Repo-relative file to edit.
+        anchor: Existing text to insert after. Must appear exactly once.
+        text: The new lines to insert.
+
+    Returns:
+        A report with the resulting diff, or an actionable error message.
+    """
+    from agent import patch as patcher
+
+    try:
+        target = _resolve(path)
+    except PathEscapeError as exc:
+        return f"Error: {exc}"
+    if not target.is_file():
+        return f"Error: no such file: {path} (use write_file to create it)"
+
+    try:
+        before = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return f"Error: could not read {path}: {exc}"
+
+    try:
+        result = patcher.insert_after(before, anchor, text, path)
+    except patcher.PatchError as exc:
+        return f"Error: {exc}"
+
+    try:
+        target.write_text(result.text, encoding="utf-8")
+    except OSError as exc:
+        return f"Error: could not write {path}: {exc}"
+
+    return patcher.summarise(result, path)
+
+
+def write_file(path: str, content: str, overwrite: bool = False) -> str:
+    """Create a file, or replace one wholesale when explicitly told to.
+
+    Overwriting an existing file requires ``overwrite=True``. That guard is
+    the point: a whole-file rewrite is how unrelated code gets reformatted
+    and how functions silently disappear, so the default path for an
+    existing file is `edit_file`.
 
     Args:
         path: Repo-relative path to write.
-        content: Full new contents of the file.
+        content: Full contents of the file.
+        overwrite: Permit replacing an existing file.
 
     Returns:
         A short confirmation, or an error message.
@@ -332,6 +414,13 @@ def write_file(path: str, content: str) -> str:
         return f"Error: {path} is a directory"
 
     existed = target.exists()
+    if existed and not overwrite:
+        return (
+            f"Error: {path} already exists. Use edit_file to change part of "
+            "it -- that keeps the rest of the file byte-identical and the "
+            "diff small. Only if you genuinely must replace the whole file, "
+            "call write_file again with overwrite=true."
+        )
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
@@ -612,10 +701,68 @@ TOOLS: list[dict[str, Any]] = [
         ["question"],
     ),
     _function(
+        "edit_file",
+        "Change one region of an existing file, leaving everything else "
+        "byte-identical. This is how you edit code: supply a snippet of the "
+        "current text and its replacement. Keep old_text as small as it can "
+        "be while still appearing exactly once in the file -- usually one "
+        "function or a few lines. The result includes the diff so you can "
+        "confirm you changed what you meant to.",
+        {
+            "path": {
+                "type": "string",
+                "description": "File to edit, relative to the repository root.",
+            },
+            "old_text": {
+                "type": "string",
+                "description": (
+                    "Exact existing text to replace, copied from read_file "
+                    "output without the line numbers. Must be unique in the "
+                    "file; add surrounding lines if it is not."
+                ),
+            },
+            "new_text": {
+                "type": "string",
+                "description": (
+                    "Replacement text. Use an empty string to delete the "
+                    "region."
+                ),
+            },
+        },
+        ["path", "old_text", "new_text"],
+    ),
+    _function(
+        "insert_after",
+        "Insert new lines immediately after an existing anchor in a file. "
+        "Use this for pure additions -- a new route beside the existing "
+        "ones, a new handler after the last one -- so you do not retype the "
+        "anchor. For Express, remember a literal path must be registered "
+        "before a parameterised one on the same prefix.",
+        {
+            "path": {
+                "type": "string",
+                "description": "File to edit, relative to the repository root.",
+            },
+            "anchor": {
+                "type": "string",
+                "description": (
+                    "Exact existing text to insert after. Must be unique in "
+                    "the file."
+                ),
+            },
+            "text": {
+                "type": "string",
+                "description": "The new lines to insert.",
+            },
+        },
+        ["path", "anchor", "text"],
+    ),
+    _function(
         "write_file",
-        "Create a file or overwrite it completely, creating parent "
-        "directories as needed. The content you supply replaces the whole "
-        "file, so read it first unless you are creating it.",
+        "Create a NEW file. For a file that already exists, use edit_file "
+        "instead -- write_file will refuse unless you also pass "
+        "overwrite=true, because rewriting a whole file reformats code you "
+        "did not mean to touch and can silently drop functions.",
         {
             "path": {
                 "type": "string",
@@ -623,7 +770,14 @@ TOOLS: list[dict[str, Any]] = [
             },
             "content": {
                 "type": "string",
-                "description": "Full new contents of the file.",
+                "description": "Full contents of the file.",
+            },
+            "overwrite": {
+                "type": "boolean",
+                "description": (
+                    "Set true only to deliberately replace an existing file "
+                    "in full."
+                ),
             },
         },
         ["path", "content"],
@@ -649,6 +803,8 @@ _IMPLEMENTATIONS: dict[str, Callable[..., str]] = {
     "read_file": read_file,
     "search_code": search_code,
     "search_repo": search_repo,
+    "edit_file": edit_file,
+    "insert_after": insert_after,
     "write_file": write_file,
     "run_shell": run_shell,
 }

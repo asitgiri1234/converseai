@@ -625,7 +625,7 @@ def _handle_tool_calls(message: Any, mem: Any = None) -> list[dict[str, Any]]:
             try:
                 if name == "read_file" and path:
                     mem.record_read(path, call.id)
-                elif name == "write_file" and path:
+                elif name in ("write_file", "edit_file", "insert_after") and path:
                     mem.record_write(path, call.id)
             except Exception as exc:  # noqa: BLE001 - memory must not kill a run
                 _say(f"    {_BAD} memory update failed ({exc}); continuing")

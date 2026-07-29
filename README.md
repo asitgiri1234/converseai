@@ -24,6 +24,7 @@ narrated to the terminal as it happens.
 - [Context compression and token benchmark](#context-compression-and-token-benchmark)
 - [How repository exploration works](#how-repository-exploration-works)
 - [Semantic search](#semantic-search)
+- [Patch-based editing](#patch-based-editing)
 - [Tool reference](#tool-reference)
 - [Message formats](#message-formats)
 - [Safety model](#safety-model)
@@ -169,6 +170,7 @@ replays it every turn.
 | `agent/intel.py` | The pre-scan: architecture detection, file roles, symbol index, rendering | Call the LLM, the network, or mutate anything |
 | `agent/graph.py` | Relationships: imports, route wiring, call edges, DB touchpoints | Read the filesystem twice — it works from the scan |
 | `agent/search.py` | Question intent, multi-signal ranking, evidence strings | Call a model or an embedding service |
+| `agent/patch.py` | Locating an edit region, applying it, proving nothing else moved | Touch the filesystem — it is pure string work |
 | `agent/memory.py` | Module summaries, explored files, discovered APIs, compression source | Decide when to compress — the loop asks it |
 | `agent/llm.py` | Client construction, model defaults, one request/response | Loop, retry, or interpret the response |
 | `agent/prompts.py` | The stable system prompt and the opening user message | Know about tools or the API |
@@ -579,6 +581,89 @@ handling*, which the app does implement, correctly returns the controller.
 
 ---
 
+## Patch-based editing
+
+The agent used to change code by retyping whole files. That was the single
+largest source of diff noise in this project: a model asked to add one
+endpoint would rewrite the file and "tidy" everything it retyped. One recorded
+run produced **105 insertions and 90 deletions** for a change needing about a
+dozen lines. Worse, a retyped file can silently drop a function or convert a
+module's export shape — which
+[happened, and killed the app at startup](#the-planning-stage).
+
+`agent/patch.py` replaces that with anchored replacement. The caller supplies
+a snippet of the *existing* text plus its replacement; everything outside the
+matched span is preserved byte for byte.
+
+### The strategy
+
+**1. Locate the smallest region.** The model supplies the smallest snippet
+that is unique in the file. Matching is strict, in two tiers:
+
+| Situation | Result |
+| --- | --- |
+| Anchor appears verbatim, exactly once | apply (`exact`) |
+| Appears once ignoring trailing whitespace | apply (`whitespace`) |
+| Appears more than once | **refuse** — "appears 3 times… include more context" |
+| Does not appear | **refuse** — names the closest line in the file |
+
+Refusals are errors the model can act on, never silent guesses. Applying an
+edit to the wrong one of three identical blocks is worse than not editing.
+
+**2. Preserve everything else.** The new file is
+`before[:start] + new_text + before[end:]`. Untouched code is not reformatted,
+reordered, or lost — not by policy but by construction.
+
+**3. Verify only the intended change.** `verify_untouched` asserts that every
+byte outside the replaced span is identical. It holds by construction, so it
+guards against a future refactor quietly breaking the guarantee the engine
+rests on.
+
+**4. Show the diff back.** Every patch returns its own unified diff, so the
+model sees exactly what it did and can catch a wrong-anchor edit immediately
+rather than at verification.
+
+`insert_after` handles pure additions — a route beside the existing ones, a
+handler after the last one — without retyping the anchor. It always inserts at
+a **line boundary**: an anchor ending mid-line would otherwise splice new text
+into the middle of a statement. (That bug was caught by the test suite, not by
+review.)
+
+### `write_file` is now guarded
+
+Overwriting an existing file requires `overwrite=true`. The default path for
+an existing file is `edit_file`, and the refusal says so:
+
+```
+Error: app/routes/note.routes.js already exists. Use edit_file to change part
+of it -- that keeps the rest of the file byte-identical and the diff small.
+```
+
+Creating new files is unaffected.
+
+### Measured: before and after
+
+Same feature (`GET /notes/count`), same repository. The whole-file numbers are
+from **real recorded agent runs**, not estimates:
+
+| Approach | Diff | Churn |
+| --- | --- | --- |
+| Whole-file rewrite (`llama-3.3-70b`, recorded) | +105 / −90 | 195 |
+| Whole-file rewrite (`gpt-oss-120b`, recorded) | +15 / −0 | 15 |
+| **Patch-based** (through the real loop and tools) | **+13 / −0** | **13** |
+
+93% smaller than the bad case, 13% smaller than the good one. The honest
+reading: when a model already writes a clean additive rewrite, patching wins
+little. Its value is that it makes the catastrophic case **structurally
+impossible** rather than dependent on model discipline.
+
+The resulting diff is two pure-addition hunks, and the patched app was
+verified running: `GET /notes/count` → `{"count":10}`, `GET /notes` → 200,
+`node --check` clean on both files, route registered before `/notes/:noteId`,
+and `module.exports = (app) => {` preserved.
+
+---
+
 ## Tool reference
 
 Tools are declared in OpenAI function format — Groq speaks the OpenAI
@@ -591,7 +676,9 @@ which **always returns a string and never raises**.
 | `read_file` | `path` | Contents with line numbers | 500 lines; refuses binaries (NUL-byte check) |
 | `search_code` | `pattern` | Regex across all text files → `file:line:match` | 50 results; skips binaries and files > 2 MB; match lines clipped to 200 chars |
 | `search_repo` | `question` | Plain-English question → ranked hits with locations and evidence, see [Semantic search](#semantic-search) | 8 hits; returns nothing rather than a weak guess |
-| `write_file` | `path`, `content` | Create or overwrite, creating parent directories | Reports created-vs-overwrote plus line and byte counts |
+| `edit_file` | `path`, `old_text`, `new_text` | Replace one located region; everything else stays byte-identical | Anchor must be unique; returns the diff. See [Patch-based editing](#patch-based-editing) |
+| `insert_after` | `path`, `anchor`, `text` | Insert lines after a unique anchor, at a line boundary | For pure additions |
+| `write_file` | `path`, `content`, `overwrite` | Create a **new** file | Refuses an existing file unless `overwrite=true` |
 | `run_shell` | `command` | Runs via the platform shell with `cwd` = repo root | 30 s timeout; output capped at 20,000 chars; returns exit code + stdout + stderr |
 
 Failures are returned as strings prefixed `Error:` — unknown tool, bad
@@ -988,12 +1075,13 @@ cross-agent coordination and roughly N× the tokens. For a six-file repo the
 coordination overhead would exceed the benefit. The cost: no independent review
 — the VERIFY phase is the same model marking its own homework.
 
-**Whole-file writes, not diff edits.** `write_file` replaces the entire file, so
-the agent must reproduce everything it is not changing. Simple, unambiguous, and
-it cannot produce a malformed hunk. But it costs output tokens proportional to
-file size, risks truncation on large files, and invites gratuitous reformatting
-— all three were observed. A `str_replace`-style edit tool is the right call
-above a few hundred lines.
+**Anchored patches, not whole-file writes or unified diffs.** The agent
+supplies a unique snippet and its replacement rather than a `@@` hunk. A hunk
+carries line numbers that go stale the moment anything above shifts, and a
+model that miscounts context lines produces a patch that will not apply;
+anchored text has no line numbers to get wrong. The cost is that the anchor
+must be unique — hence the ambiguity refusal — and that a model must copy
+existing text exactly. See [Patch-based editing](#patch-based-editing).
 
 **Deterministic pre-scan, not embeddings.** The Repository Intelligence Engine
 is regex-and-heuristic Python: free, instant, reproducible, and wrong in
@@ -1053,6 +1141,12 @@ and revert by hand.
   ("where does the system fan out work?") will find nothing, where an
   embedding model might. Extending it means adding words to
   `ACTIONS`/`CONCEPTS` in `agent/search.py`, not retraining anything.
+- **Patching shifts the failure mode rather than removing it.** A model can
+  still choose a wrong-but-unique anchor and patch the wrong function, and it
+  must copy existing text exactly — a near-miss anchor costs a turn. The
+  engine is fully covered by tests and benchmarked through the real loop and
+  tools, but a *model-driven* patch has not yet completed a live run: the
+  daily token budget ran out at the implementation turn, twice.
 - **`search_repo` is verified offline but not yet inside a completed live
   run.** Its engine, ranking, and tool dispatch are covered by tests, and a
   live model did choose it with a sensible question — but that run failed on
@@ -1075,6 +1169,7 @@ converseai/
 │   ├── graph.py         Knowledge graph: imports, routes, calls, DB edges
 │   ├── intel.py         Repository Intelligence Engine (pre-scan, no LLM)
 │   ├── memory.py        Repository memory + module summaries (compression)
+│   ├── patch.py         Patch engine: locate, apply, verify, diff
 │   ├── search.py        Semantic search: intent parsing, ranking, evidence
 │   ├── llm.py           Groq client wrapper — one request, one response
 │   ├── loop.py          Turn loop, retries, context elision, console output

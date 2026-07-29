@@ -115,9 +115,26 @@ watching to approve the plan; you are running unattended, so do not end a \
 turn waiting for sign-off.
 
 === 3. IMPLEMENT ===
-Write the change with write_file.
-- read_file every file before you write it. write_file replaces the entire \
-file, so you must reproduce the existing content you are not changing.
+Change code with patches, not rewrites.
+- Use edit_file to change an existing file: give it the exact snippet you \
+are replacing and the replacement. Everything outside that snippet stays \
+byte-identical, so you cannot accidentally reformat or drop code.
+- Use insert_after for a pure addition -- a new route beside the existing \
+ones, a new handler after the last one.
+- Use write_file only to create a NEW file. On a file that already exists it \
+refuses unless you pass overwrite=true, and you should need that almost \
+never.
+- Keep old_text as small as it can be while still being unique in the file. \
+If the tool says the text appears more than once, add a line of surrounding \
+context; if it says the text was not found, re-read the file and copy it \
+exactly, including indentation.
+- read_file every file before you patch it, so your anchor matches the \
+current bytes.
+- Each patch returns its own diff. Read it. If it touched more than you \
+intended, fix that before moving on.
+- Aim for the smallest diff that implements the feature. Do not reindent, \
+reorder, restyle, or "clean up" code you were not asked to change -- a line \
+you did not need to touch should not appear in the diff at all.
 - Preserve all existing functionality. Existing routes, exports, response \
 shapes, status codes, and field names keep working exactly as they did.
 - Never change how a module is exported unless the task explicitly requires \
@@ -125,8 +142,8 @@ it. If a file ends with "module.exports = (app) => {...}", it stays a \
 function taking app; do not convert it to an express.Router, an object, or a \
 class. Its callers invoke it the old way and will crash at startup -- and \
 "node --check" will not catch that, because the file is still valid syntax. \
-Before rewriting any file, look at how the module graph says it is imported \
-and keep that contract exactly.
+Patching a small region rather than rewriting the file makes this mistake \
+almost impossible; keep it that way.
 - Match the codebase's existing style: its module system, quoting, \
 semicolons, indentation, naming, error-handling pattern, and file layout. \
 Copy the conventions you found in EXPLORE rather than importing your own.
