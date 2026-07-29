@@ -16,6 +16,7 @@ truncated input, one-line result preview -- so a run is readable as it happens.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -25,7 +26,14 @@ import groq
 
 from agent import memory as repo_memory
 from agent.llm import LLM
-from agent.prompts import SUMMARY_MARKER, build_system_prompt, build_task_message
+from agent.prompts import (
+    PLAN_SECTIONS,
+    SUMMARY_MARKER,
+    build_plan_repair_nudge,
+    build_system_prompt,
+    build_task_message,
+    missing_plan_sections,
+)
 from agent.tools import TOOLS, dispatch, set_repo_root
 
 # Safety valve: stop after this many model turns even if the agent is still
@@ -66,6 +74,21 @@ NUDGE = (
     "next phase now, using tools. When the work is genuinely complete and "
     f"verified, reply with your {SUMMARY_MARKER} section."
 )
+
+PLAN_MARKER = "PLAN:"
+
+# A nine-section plan is a large assistant message, and assistant messages
+# are never elided -- so an old plan otherwise costs its full size on every
+# later request. Once the decision is made, the deliberation sections have
+# done their job; these are the ones IMPLEMENT and VERIFY still need.
+KEEP_PLAN_SECTIONS = frozenset({"CHOSEN", "FILES", "RISKS", "VERIFICATION", "IMPACT"})
+# Messages back from the end that keep their plan verbatim.
+KEEP_PLAN_FULL = 6
+# One repair attempt only. An incomplete plan is worth one targeted ask; a
+# model that will not produce nine sections twice will not produce them on a
+# third try either, and every retry is a full request against the token
+# budget.
+MAX_PLAN_REPAIRS = 1
 
 
 # --------------------------------------------------------------------------
@@ -220,6 +243,8 @@ def run(
     tokens_in = tokens_out = 0
     tool_calls = 0
     nudges = 0
+    plan_repairs = 0
+    plan_seen = False
 
     for turn in range(1, max_turns + 1):
         # Header first, so a slow call or a retry notice lands under the turn
@@ -250,6 +275,19 @@ def run(
             if SUMMARY_MARKER not in final and nudges < MAX_NUDGES:
                 nudges += 1
                 _log_text(final)
+
+                # The nudge fires anyway on a plan turn, so incomplete-plan
+                # feedback rides along instead of costing its own request.
+                missing = _log_plan_coverage(final)
+                if missing and plan_repairs < MAX_PLAN_REPAIRS:
+                    plan_repairs += 1
+                    plan_seen = True
+                    messages.append(
+                        {"role": "user", "content": build_plan_repair_nudge(missing)}
+                    )
+                    continue
+
+                plan_seen = plan_seen or PLAN_MARKER in final
                 _say(f"  {_CALL} no {SUMMARY_MARKER} yet -- continuing")
                 messages.append({"role": "user", "content": NUDGE})
                 continue
@@ -260,7 +298,14 @@ def run(
             _log_footer(time.monotonic() - started, turn, tool_calls, tokens_in, tokens_out)
             return final
 
-        _log_text((message.content or "").strip())
+        text = (message.content or "").strip()
+        _log_text(text)
+        # A plan emitted alongside tool calls never reaches the nudge path,
+        # so score it here for the console record.
+        if PLAN_MARKER in text and not plan_seen:
+            plan_seen = True
+            _log_plan_coverage(text)
+
         results = _handle_tool_calls(message, mem)
         tool_calls += len(results)
         messages.extend(results)
@@ -377,7 +422,76 @@ def _elide_old_results(
                 )
                 mem.compressed_ids.add(call_id)
         trimmed.append({**entry, "content": replacement})
-    return trimmed
+    return _condense_old_plan(trimmed)
+
+
+def _condense_old_plan(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop the deliberation sections from a plan that is no longer fresh.
+
+    STRATEGIES and TRADE-OFFS exist to justify a choice. Once CHOSEN is
+    written the decision is made, but the assistant message holding them is
+    never elided and so costs its full size on every later request. This
+    keeps the sections IMPLEMENT and VERIFY still act on.
+
+    Args:
+        messages: Payload being assembled. Not mutated.
+
+    Returns:
+        A copy with stale plan text condensed; ``tool_calls`` preserved.
+    """
+    cutoff = len(messages) - KEEP_PLAN_FULL
+    out: list[dict[str, Any]] = []
+
+    for i, entry in enumerate(messages):
+        content = entry.get("content") or ""
+        if (
+            i >= cutoff
+            or entry.get("role") != "assistant"
+            or PLAN_MARKER not in content
+            or len(content) <= ELIDE_OVER_CHARS
+        ):
+            out.append(entry)
+            continue
+
+        kept = _plan_excerpt(content)
+        out.append({**entry, "content": kept} if kept else entry)
+    return out
+
+
+def _plan_excerpt(plan: str) -> str:
+    """Keep only the actionable sections of a plan block.
+
+    Args:
+        plan: The full assistant text containing the plan.
+
+    Returns:
+        The condensed plan, or ``""`` if the sections could not be located
+        (in which case the caller leaves the original untouched).
+    """
+    lines = plan.splitlines()
+    starts: list[tuple[int, bool]] = []  # (line index, keep this section?)
+
+    for idx, line in enumerate(lines):
+        flat = re.sub(r"[^A-Z]", "", line.upper())
+        for section in PLAN_SECTIONS:
+            token = re.sub(r"[^A-Z]", "", section.upper())
+            # Heading lines are short; this avoids matching prose mentions.
+            if flat.startswith(token) and len(line.strip()) < 120:
+                starts.append((idx, section in KEEP_PLAN_SECTIONS))
+                break
+
+    if not starts:
+        return ""
+
+    kept: list[str] = [
+        "PLAN (condensed -- strategy chosen, deliberation dropped):"
+    ]
+    for position, (start, keep) in enumerate(starts):
+        if not keep:
+            continue
+        end = starts[position + 1][0] if position + 1 < len(starts) else len(lines)
+        kept.extend(lines[start:end])
+    return "\n".join(kept).rstrip() if len(kept) > 1 else ""
 
 
 def _retry_delay(exc: Exception, attempt: int) -> float:
@@ -519,6 +633,32 @@ def _normalise_path(mem: Any, path: str) -> str:
         return p.as_posix()
     except (ValueError, OSError):
         return path.replace("\\", "/")
+
+
+def _log_plan_coverage(text: str) -> list[str]:
+    """Score a PLAN block against the nine required sections and log it.
+
+    Args:
+        text: Assistant text that may contain a plan.
+
+    Returns:
+        The missing section names, or ``[]`` when the text is not a plan at
+        all (nothing to repair) or the plan is complete.
+    """
+    if PLAN_MARKER not in text:
+        return []
+
+    missing = missing_plan_sections(text)
+    total = len(PLAN_SECTIONS)
+    if not missing:
+        _say(f"  {_OK} plan: all {total} sections present")
+        return []
+
+    _say(
+        f"  {_BAD} plan: {total - len(missing)}/{total} sections -- "
+        f"missing {', '.join(missing)}"
+    )
+    return missing
 
 
 def _log_reasoning(message: Any) -> None:

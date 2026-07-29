@@ -19,6 +19,7 @@ narrated to the terminal as it happens.
 - [Architecture](#architecture)
 - [The agent workflow](#the-agent-workflow)
 - [Repository Intelligence Engine](#repository-intelligence-engine)
+- [The planning stage](#the-planning-stage)
 - [Knowledge graph and repository memory](#knowledge-graph-and-repository-memory)
 - [Context compression and token benchmark](#context-compression-and-token-benchmark)
 - [How repository exploration works](#how-repository-exploration-works)
@@ -186,7 +187,7 @@ The system prompt drives five explicit phases.
 | Phase | What the agent does |
 | --- | --- |
 | **1. EXPLORE** | With the intelligence block present: targeted reads of only the files the task touches, located via the symbol index. Without it: `list_files`, then `package.json`, then following `require()` chains. |
-| **2. PLAN** | Emits a numbered `PLAN:` block — the feature chosen, every file it will touch with a reason, and any `Assumption:` — *before* the first edit, informed by the intelligence summary. |
+| **2. PLAN** | Emits a nine-section `PLAN:` block — understanding, interpretation, strategies, trade-offs, choice, files, risks, verification, impact — *before* the first edit, cited from the intelligence object. See [The planning stage](#the-planning-stage). |
 | **3. IMPLEMENT** | `write_file`, preserving existing routes, exports, response shapes, and field names, matching the surrounding style. Additive and backwards-compatible. |
 | **4. VERIFY** | Re-reads every modified file, runs `node --check` on each changed file, runs `npm test` / `npm run lint` if they exist. |
 | **5. SUMMARIZE** | A `SUMMARY:` section listing every file changed and why. |
@@ -273,6 +274,92 @@ detection only. The block is labelled "pre-scanned, heuristic — verify" and
 the prompt tells the model to treat it as a map, not gospel. A scan failure
 never kills a run — the agent falls back to tool-driven exploration, and
 `--no-intel` forces that mode.
+
+---
+
+## The planning stage
+
+PLAN is not "list the files you'll touch" — it is a nine-section engineering
+document the agent must produce before its first edit, grounded in the
+intelligence object rather than in assumptions.
+
+| # | Section | What it must contain |
+| --- | --- | --- |
+| 1 | `UNDERSTANDING` | What the repo is, and the parts this task touches — cited as `file:line` symbol entries, `route -> handler` wirings, or module summaries |
+| 2 | `INTERPRETATION` | What the request concretely means here, what it excludes, and any `Assumption:` |
+| 3 | `STRATEGIES` | At least two genuinely different approaches, labelled A and B |
+| 4 | `TRADE-OFFS` | For each: what it costs and buys — effort, blast radius, performance, fit with conventions |
+| 5 | `CHOSEN` | Which one, and why |
+| 6 | `FILES` | Every file to create or modify, with a reason, using exact paths from the scan |
+| 7 | `RISKS` | Specific routes, exports, response shapes or schema fields at risk — including which modules import the file being changed |
+| 8 | `VERIFICATION` | The exact checks to run afterwards |
+| 9 | `IMPACT` | What changes for existing behaviour, and what is guaranteed unchanged |
+
+**The grounding rule** is the point of the redesign: every factual claim about
+the repository must come from the intelligence block, the module graph, a
+module summary, or a file actually read this run. If the agent cannot support
+a claim it must read the file first or mark the line `unverified`.
+
+### Enforcement
+
+`PLAN_SECTIONS` in `agent/prompts.py` is the single source of truth — the
+test suite asserts every entry also appears in `SYSTEM_PROMPT`, so the spec
+and the validator cannot drift. The loop scores each plan and logs it:
+
+```
+  ✓ plan: all 9 sections present
+  ✗ plan: 3/9 sections -- missing STRATEGIES, TRADE-OFFS, CHOSEN, RISKS, VERIFICATION, IMPACT
+```
+
+An incomplete plan gets **one** targeted repair asking only for the missing
+sections — and it rides on the nudge that a text-only PLAN turn triggers
+anyway, so it costs no extra request. Matching is deliberately forgiving
+(`TRADE-OFFS`, `Trade offs:`, `**TRADEOFFS**` all count); rejecting a good
+plan over punctuation would waste a turn on a tight token budget.
+
+### Plan condensation
+
+A nine-section plan is a large *assistant* message, and assistant messages are
+never elided — so an old plan would otherwise cost its full size on every
+later request. Once `CHOSEN` is written, the deliberation has done its job, so
+a plan older than six messages is condensed to `CHOSEN`, `FILES`, `RISKS`,
+`VERIFICATION`, `IMPACT`:
+
+```
+PLAN (condensed -- strategy chosen, deliberation dropped):
+5. CHOSEN: Strategy A, one round trip.
+6. FILES: app/controllers/note.controller.js - add stats; ...
+```
+
+Measured at ~46% smaller on a real plan. This was not optional: the first live
+run of the nine-section format **413'd at turn 10** with a 9,648-token request.
+With condensation the same point in the run was 7,887 tokens, under the 8k
+limit.
+
+### What it does and does not buy
+
+Verified live: `gpt-oss-120b` and `llama-3.3-70b-versatile` both produced all
+nine sections, with genuinely distinct strategies (a Mongoose aggregation
+pipeline versus fetching documents and computing in application code) and
+trade-offs naming round-trips and memory cost.
+
+**It does not make a weak model safe.** In one run `llama-3.3-70b` wrote a
+plan whose `IMPACT` section claimed existing behaviour was untouched, then
+converted `note.routes.js` from `module.exports = (app) => {...}` to an
+`express.Router`. `node --check` passed — the file was valid syntax — and the
+app crashed at startup, because `server.js` calls that module as a function.
+The plan structure did not prevent it. Two prompt guards were added in
+response:
+
+| Guard | Result |
+| --- | --- |
+| Never change a module's export shape; check the graph's importers first | **Worked** — the crash stopped reproducing, app boots, existing endpoints 200 |
+| Register literal routes before parameterised ones on the same prefix | **Did not work** on `llama-3.3-70b` — it still appended `/notes/stats` after `/notes/:noteId`, so the endpoint 404s. `gpt-oss-120b` gets this right unprompted |
+
+The honest reading: structured planning improves the *reasoning that is
+visible to you* and catches some classes of error, but it is not a substitute
+for a capable model, and a plan asserting safety is not evidence of safety.
+Read the diff.
 
 ---
 
@@ -841,6 +928,11 @@ and revert by hand.
 - **Model quality dominates outcomes.** The phase structure is followed loosely,
   not reliably. Weaker models re-plan in circles, reformat files they were told
   to leave alone, and occasionally emit malformed tool-call JSON.
+- **A complete plan is not a safe change.** All nine sections can be present,
+  including `RISKS` and `IMPACT` asserting nothing breaks, while the edit
+  silently breaks the app — observed and documented in
+  [The planning stage](#the-planning-stage). `node --check` proves a file
+  parses, nothing more. Review the diff and run the app.
 - **Free-tier token limits are the practical ceiling.** 8,000 TPM on most Groq
   models, 12,000 on `llama-3.3-70b-versatile`, plus a daily cap. A repo much
   larger than the notes app needs a paid tier.
