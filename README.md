@@ -25,6 +25,8 @@ narrated to the terminal as it happens.
 - [Console output](#console-output)
 - [Context and rate-limit management](#context-and-rate-limit-management)
 - [Verified run](#verified-run)
+- [Running the result locally](#running-the-result-locally)
+- [Frontend](#frontend)
 - [Troubleshooting](#troubleshooting)
 - [Extending the agent](#extending-the-agent)
 - [Development and testing](#development-and-testing)
@@ -438,6 +440,66 @@ token budget before registering its route — leaving unreachable dead code.
 
 ---
 
+## Running the result locally
+
+To see the agent's changes running rather than just reading the diff:
+
+```bash
+# 1. MongoDB — 4.4 matches the app's old Mongoose 5.2 driver
+docker run -d --name easy-notes-mongo -p 27017:27017 mongo:4.4
+
+# 2. The notes app (with the agent's edits) on http://localhost:3000
+cd target-repo
+npm install
+node server.js
+```
+
+Then exercise it — the agent-written endpoint included:
+
+```bash
+curl -X POST http://localhost:3000/notes \
+     -H "Content-Type: application/json" \
+     -d '{"title":"Groceries","content":"milk, eggs"}'
+curl http://localhost:3000/notes/count        # → {"count":1}
+```
+
+Teardown: stop the Node process and `docker rm -f easy-notes-mongo`.
+
+---
+
+## Frontend
+
+`frontend/` is a browser UI for the notes app — list, create, edit, delete,
+live search with match highlighting, and a note-count badge fed by the
+agent-written `/notes/count` endpoint.
+
+```bash
+# with the backend from the previous section running:
+python frontend/serve.py            # → http://localhost:8080
+```
+
+Two files, no build step, no dependencies:
+
+| File | Role |
+| --- | --- |
+| `frontend/index.html` | The whole UI — vanilla JS, single file, light/dark via `prefers-color-scheme` |
+| `frontend/serve.py` | Stdlib-only static server that also proxies `/notes*` to the Express app |
+
+**Why the proxy exists:** the Express app ships no CORS headers, so a page
+served from another origin cannot fetch it — and the app lives in
+`target-repo/`, which this project deliberately does not modify by hand. The
+proxy makes the browser talk to one origin (`:8080`) and relays `/notes*` to
+`:3000` (`--api` to point elsewhere, `--port` to move it). Express error
+responses (400/404/500) are relayed with status and JSON body intact, so the
+UI can show the API's own error messages.
+
+The UI treats the server as the source of truth: every mutation refreshes the
+list and the count from the API rather than patching local state. Search is
+client-side filtering over the fetched list — fine at this scale, and it keeps
+the backend untouched.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
@@ -627,6 +689,9 @@ converseai/
 │   ├── loop.py          Turn loop, retries, context elision, console output
 │   ├── prompts.py       System prompt (five phases) and the opening message
 │   └── tools.py         Tool schemas, dispatch, path and command safety
+├── frontend/
+│   ├── index.html       Browser UI for the notes app (single file, no build)
+│   └── serve.py         Static server + /notes* proxy (stdlib only)
 ├── requirements.txt     groq, python-dotenv
 ├── .env.example         Template for .env (gitignored)
 └── target-repo/         Whatever you clone to work on (gitignored)

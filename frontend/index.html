@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EasyNotes</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --surface: #ffffff;
+    --border: #e3e6ea;
+    --text: #1c2733;
+    --muted: #67737f;
+    --accent: #2563eb;
+    --accent-soft: #eff4ff;
+    --danger: #dc2626;
+    --radius: 10px;
+    --shadow: 0 1px 3px rgba(16, 24, 40, .08);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #10151b;
+      --surface: #1a212a;
+      --border: #2a3441;
+      --text: #e7ecf2;
+      --muted: #8b98a5;
+      --accent: #5b8def;
+      --accent-soft: #1d2a42;
+      --danger: #f87171;
+      --shadow: 0 1px 3px rgba(0, 0, 0, .4);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 24px 16px 64px; }
+
+  header {
+    display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+    margin-bottom: 20px;
+  }
+  h1 { font-size: 22px; margin: 0; }
+  #count {
+    font-size: 13px; color: var(--accent);
+    background: var(--accent-soft);
+    border-radius: 999px; padding: 2px 10px;
+  }
+  #status { font-size: 13px; color: var(--muted); margin-left: auto; }
+  #status.error { color: var(--danger); }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+  }
+
+  form.card { padding: 14px; margin-bottom: 20px; }
+  form .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  input, textarea, button {
+    font: inherit; color: inherit;
+    border-radius: calc(var(--radius) - 4px);
+  }
+  input[type="text"], textarea {
+    width: 100%;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    padding: 8px 10px;
+  }
+  input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+  textarea { resize: vertical; min-height: 64px; margin-top: 10px; }
+  form footer { display: flex; justify-content: flex-end; margin-top: 10px; }
+
+  button {
+    border: 1px solid var(--border);
+    background: var(--surface);
+    padding: 7px 14px;
+    cursor: pointer;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger  { color: var(--danger); }
+  button:disabled { opacity: .5; cursor: default; }
+
+  .toolbar { display: flex; gap: 10px; margin-bottom: 14px; }
+  .toolbar input { flex: 1; }
+
+  ul#notes { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
+  li.note { padding: 14px; }
+  li.note h2 { font-size: 16px; margin: 0 0 4px; overflow-wrap: anywhere; }
+  li.note p  { margin: 0 0 10px; color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; }
+  li.note time { font-size: 12px; color: var(--muted); }
+  li.note .actions { display: flex; gap: 8px; justify-content: flex-end; }
+  li.note.editing textarea, li.note.editing input { margin-bottom: 10px; }
+
+  #empty { text-align: center; color: var(--muted); padding: 40px 0; }
+  mark { background: var(--accent-soft); color: var(--accent); border-radius: 3px; padding: 0 1px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>EasyNotes</h1>
+    <span id="count" hidden></span>
+    <span id="status"></span>
+  </header>
+
+  <form id="create" class="card">
+    <div class="row"><input id="new-title" type="text" placeholder="Title (optional)" maxlength="200"></div>
+    <textarea id="new-content" placeholder="Write a note… (required)" required></textarea>
+    <footer><button type="submit" class="primary">Add note</button></footer>
+  </form>
+
+  <div class="toolbar">
+    <input id="search" type="text" placeholder="Search notes…" autocomplete="off">
+    <button id="refresh" type="button" title="Reload from server">Refresh</button>
+  </div>
+
+  <ul id="notes"></ul>
+  <div id="empty" hidden>No notes yet — add one above.</div>
+</div>
+
+<script>
+"use strict";
+// Same-origin API: serve.py proxies /notes* to the Express app, so no CORS.
+const API = "";
+
+const $ = (id) => document.getElementById(id);
+let notes = [];          // last full list from the server
+let editingId = null;    // _id of the note open in the inline editor
+
+function setStatus(text, isError) {
+  const el = $("status");
+  el.textContent = text || "";
+  el.className = isError ? "error" : "";
+}
+
+async function api(path, options) {
+  const res = await fetch(API + path, options);
+  if (!res.ok) {
+    let detail = res.status + " " + res.statusText;
+    try { detail = (await res.json()).message || detail; } catch (_) {}
+    throw new Error(detail);
+  }
+  return res.status === 204 ? null : res.json();
+}
+
+async function refresh() {
+  setStatus("loading…");
+  try {
+    const [list, count] = await Promise.all([
+      api("/notes"),
+      api("/notes/count"),
+    ]);
+    notes = list;
+    const badge = $("count");
+    badge.hidden = false;
+    badge.textContent = count.count + (count.count === 1 ? " note" : " notes");
+    render();
+    setStatus("");
+  } catch (err) {
+    setStatus("Cannot reach the API: " + err.message, true);
+  }
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
+// Escaped text with <mark> around case-insensitive matches of `query`.
+function highlight(text, query) {
+  const safe = escapeHtml(text);
+  if (!query) return safe;
+  const pattern = escapeHtml(query).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return safe.replace(new RegExp("(" + pattern + ")", "gi"), "<mark>$1</mark>");
+}
+
+function render() {
+  const query = $("search").value.trim().toLowerCase();
+  const shown = query
+    ? notes.filter((n) =>
+        (n.title || "").toLowerCase().includes(query) ||
+        (n.content || "").toLowerCase().includes(query))
+    : notes;
+
+  const list = $("notes");
+  list.innerHTML = "";
+  $("empty").hidden = shown.length > 0;
+  $("empty").textContent = notes.length === 0
+    ? "No notes yet — add one above."
+    : "No notes match your search.";
+
+  for (const note of shown) {
+    const li = document.createElement("li");
+    li.className = "note card";
+
+    if (note._id === editingId) {
+      li.classList.add("editing");
+      li.innerHTML =
+        '<input type="text" class="edit-title" maxlength="200">' +
+        '<textarea class="edit-content"></textarea>' +
+        '<div class="actions">' +
+        '  <button type="button" class="cancel">Cancel</button>' +
+        '  <button type="button" class="primary save">Save</button>' +
+        "</div>";
+      li.querySelector(".edit-title").value = note.title || "";
+      li.querySelector(".edit-content").value = note.content || "";
+      li.querySelector(".save").onclick = () => saveEdit(note._id, li);
+      li.querySelector(".cancel").onclick = () => { editingId = null; render(); };
+    } else {
+      const when = note.updatedAt
+        ? new Date(note.updatedAt).toLocaleString()
+        : "";
+      li.innerHTML =
+        "<h2>" + highlight(note.title || "Untitled Note", query) + "</h2>" +
+        "<p>" + highlight(note.content || "", query) + "</p>" +
+        '<div class="actions">' +
+        "  <time>" + when + "</time>" +
+        '  <span style="flex:1"></span>' +
+        '  <button type="button" class="edit">Edit</button>' +
+        '  <button type="button" class="danger delete">Delete</button>' +
+        "</div>";
+      li.querySelector(".edit").onclick = () => { editingId = note._id; render(); };
+      li.querySelector(".delete").onclick = () => removeNote(note._id);
+    }
+    list.appendChild(li);
+  }
+}
+
+$("create").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const content = $("new-content").value.trim();
+  if (!content) return;
+  try {
+    await api("/notes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: $("new-title").value.trim(), content }),
+    });
+    $("new-title").value = "";
+    $("new-content").value = "";
+    await refresh();
+  } catch (err) {
+    setStatus("Create failed: " + err.message, true);
+  }
+});
+
+async function saveEdit(id, li) {
+  const content = li.querySelector(".edit-content").value.trim();
+  if (!content) { setStatus("Content cannot be empty.", true); return; }
+  try {
+    await api("/notes/" + id, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        title: li.querySelector(".edit-title").value.trim(),
+        content,
+      }),
+    });
+    editingId = null;
+    await refresh();
+  } catch (err) {
+    setStatus("Update failed: " + err.message, true);
+  }
+}
+
+async function removeNote(id) {
+  if (!confirm("Delete this note?")) return;
+  try {
+    await api("/notes/" + id, { method: "DELETE" });
+    if (editingId === id) editingId = null;
+    await refresh();
+  } catch (err) {
+    setStatus("Delete failed: " + err.message, true);
+  }
+}
+
+$("search").addEventListener("input", render);
+$("refresh").addEventListener("click", refresh);
+refresh();
+</script>
+</body>
+</html>
