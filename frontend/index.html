@@ -4,103 +4,251 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>EasyNotes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bangers&family=Permanent+Marker&family=Rock+Salt&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #f6f7f9;
-    --surface: #ffffff;
-    --border: #e3e6ea;
-    --text: #1c2733;
-    --muted: #67737f;
-    --accent: #2563eb;
-    --accent-soft: #eff4ff;
-    --danger: #dc2626;
-    --radius: 10px;
-    --shadow: 0 1px 3px rgba(16, 24, 40, .08);
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #10151b;
-      --surface: #1a212a;
-      --border: #2a3441;
-      --text: #e7ecf2;
-      --muted: #8b98a5;
-      --accent: #5b8def;
-      --accent-soft: #1d2a42;
-      --danger: #f87171;
-      --shadow: 0 1px 3px rgba(0, 0, 0, .4);
-    }
+    --bg: #1a1a16;
+    --surface: rgba(18, 18, 16, 0.72);
+    --border: #f4e04d;
+    --text: #f4f0e6;
+    --muted: #c8bfa8;
+    --accent: #ff2d95;
+    --accent-2: #39ff14;
+    --accent-3: #00e5ff;
+    --accent-soft: rgba(255, 45, 149, 0.22);
+    --danger: #ff4d1c;
+    --radius: 4px;
+    --shadow: 6px 8px 0 #111, 0 0 28px rgba(255, 45, 149, 0.25);
   }
   * { box-sizing: border-box; }
+  html, body { min-height: 100%; }
   body {
     margin: 0;
-    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
-    background: var(--bg);
+    font: 15px/1.5 "Permanent Marker", "Comic Sans MS", cursive;
     color: var(--text);
+    background-color: #141410;
+    background-image:
+      radial-gradient(circle at 12% 18%, rgba(255, 45, 149, 0.42) 0 70px, transparent 140px),
+      radial-gradient(circle at 78% 12%, rgba(57, 255, 20, 0.32) 0 90px, transparent 180px),
+      radial-gradient(circle at 88% 72%, rgba(0, 229, 255, 0.38) 0 80px, transparent 170px),
+      radial-gradient(circle at 22% 82%, rgba(244, 224, 77, 0.34) 0 60px, transparent 150px),
+      radial-gradient(circle at 48% 40%, rgba(255, 77, 28, 0.22) 0 50px, transparent 130px),
+      radial-gradient(ellipse 180px 40px at 30% 60%, rgba(255, 45, 149, 0.18), transparent),
+      radial-gradient(ellipse 90px 220px at 70% 50%, rgba(57, 255, 20, 0.12), transparent),
+      repeating-linear-gradient(90deg, transparent 0 38px, rgba(0,0,0,.18) 38px 40px),
+      repeating-linear-gradient(0deg, transparent 0 38px, rgba(0,0,0,.12) 38px 40px),
+      linear-gradient(165deg, #2a2a24 0%, #171712 42%, #0e0e0c 100%);
+    background-attachment: fixed;
+    overflow-x: hidden;
   }
-  .wrap { max-width: 880px; margin: 0 auto; padding: 24px 16px 64px; }
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    opacity: 0.55;
+    background-image:
+      radial-gradient(circle at 8% 30%, #ff2d95 0 3px, transparent 4px),
+      radial-gradient(circle at 15% 70%, #39ff14 0 2px, transparent 3px),
+      radial-gradient(circle at 40% 12%, #f4e04d 0 4px, transparent 5px),
+      radial-gradient(circle at 62% 88%, #00e5ff 0 3px, transparent 4px),
+      radial-gradient(circle at 91% 40%, #ff2d95 0 2px, transparent 3px),
+      radial-gradient(circle at 73% 22%, #ff4d1c 0 3px, transparent 5px),
+      radial-gradient(circle at 28% 48%, #00e5ff 0 2px, transparent 3px),
+      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='220' height='220'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='220' height='220' filter='url(%23n)' opacity='.28'/%3E%3C/svg%3E");
+  }
+  body::after {
+    content: "EASY  ·  NOTES  ·  TAG  ·  BOMB";
+    position: fixed;
+    inset: auto 8% 6% auto;
+    font-family: "Bangers", sans-serif;
+    font-size: clamp(42px, 9vw, 110px);
+    letter-spacing: 6px;
+    color: transparent;
+    -webkit-text-stroke: 2px rgba(255, 45, 149, 0.18);
+    transform: rotate(-8deg);
+    pointer-events: none;
+    z-index: 0;
+    white-space: nowrap;
+  }
+  .spray-tag {
+    position: fixed;
+    pointer-events: none;
+    z-index: 0;
+    font-family: "Rock Salt", cursive;
+    opacity: 0.28;
+    color: var(--accent-2);
+    text-shadow: 0 0 18px currentColor;
+  }
+  .spray-tag.a { top: 8%; left: 3%; transform: rotate(-18deg); font-size: 22px; color: #00e5ff; }
+  .spray-tag.b { top: 42%; right: 2%; transform: rotate(12deg); font-size: 18px; color: #f4e04d; }
+  .spray-tag.c { bottom: 18%; left: 6%; transform: rotate(7deg); font-size: 16px; color: #ff2d95; }
+
+  .wrap {
+    position: relative;
+    z-index: 1;
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 28px 16px 80px;
+  }
 
   header {
     display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
-    margin-bottom: 20px;
+    margin-bottom: 24px;
   }
-  h1 { font-size: 22px; margin: 0; }
+  h1 {
+    font-family: "Bangers", sans-serif;
+    font-size: clamp(40px, 8vw, 72px);
+    margin: 0;
+    letter-spacing: 3px;
+    color: #f4e04d;
+    -webkit-text-stroke: 2px #111;
+    paint-order: stroke fill;
+    text-shadow:
+      4px 5px 0 #ff2d95,
+      8px 9px 0 #111,
+      0 0 24px rgba(244, 224, 77, 0.55);
+    transform: rotate(-2deg);
+  }
   #count {
-    font-size: 13px; color: var(--accent);
-    background: var(--accent-soft);
-    border-radius: 999px; padding: 2px 10px;
+    font-family: "Bangers", sans-serif;
+    font-size: 16px;
+    letter-spacing: 1px;
+    color: #111;
+    background: var(--accent-2);
+    border: 3px solid #111;
+    box-shadow: 3px 3px 0 #111;
+    border-radius: 2px;
+    padding: 2px 10px;
+    transform: rotate(3deg);
   }
-  #status { font-size: 13px; color: var(--muted); margin-left: auto; }
-  #status.error { color: var(--danger); }
+  #status {
+    font-size: 13px;
+    color: var(--accent-3);
+    margin-left: auto;
+    text-shadow: 0 0 10px rgba(0, 229, 255, 0.6);
+  }
+  #status.error { color: var(--danger); text-shadow: 0 0 10px rgba(255, 77, 28, 0.7); }
 
   .card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
+    background:
+      radial-gradient(circle at 12% 20%, rgba(255, 45, 149, 0.16), transparent 40%),
+      radial-gradient(circle at 90% 80%, rgba(0, 229, 255, 0.12), transparent 42%),
+      linear-gradient(160deg, rgba(32, 30, 24, 0.92), rgba(14, 14, 12, 0.88));
+    border: 3px solid #111;
+    outline: 2px solid var(--border);
+    outline-offset: -7px;
+    border-radius: 3px;
     box-shadow: var(--shadow);
+    position: relative;
+  }
+  .card::after {
+    content: "";
+    position: absolute;
+    left: 18px;
+    bottom: -14px;
+    width: 4px;
+    height: 16px;
+    background: linear-gradient(#f4e04d, transparent);
+    opacity: 0.7;
+    pointer-events: none;
   }
 
-  form.card { padding: 14px; margin-bottom: 20px; }
+  form.card { padding: 16px; margin-bottom: 22px; }
   form .row { display: flex; gap: 10px; flex-wrap: wrap; }
   input, textarea, button {
     font: inherit; color: inherit;
-    border-radius: calc(var(--radius) - 4px);
+    border-radius: 2px;
   }
   input[type="text"], textarea {
     width: 100%;
-    border: 1px solid var(--border);
-    background: var(--bg);
-    padding: 8px 10px;
+    border: 3px dashed rgba(244, 224, 77, 0.55);
+    background: rgba(8, 8, 6, 0.65);
+    padding: 10px 12px;
+    color: #fff7c2;
   }
-  input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
-  textarea { resize: vertical; min-height: 64px; margin-top: 10px; }
-  form footer { display: flex; justify-content: flex-end; margin-top: 10px; }
+  input::placeholder, textarea::placeholder { color: #8d8468; }
+  input:focus, textarea:focus {
+    outline: 3px solid var(--accent);
+    outline-offset: 1px;
+    border-color: var(--accent);
+    box-shadow: 0 0 18px rgba(255, 45, 149, 0.35);
+  }
+  textarea { resize: vertical; min-height: 72px; margin-top: 10px; }
+  form footer { display: flex; justify-content: flex-end; margin-top: 12px; }
 
   button {
-    border: 1px solid var(--border);
-    background: var(--surface);
-    padding: 7px 14px;
+    border: 3px solid #111;
+    background: #2a261c;
+    padding: 8px 16px;
     cursor: pointer;
+    font-family: "Bangers", sans-serif;
+    letter-spacing: 1px;
+    box-shadow: 3px 3px 0 #111;
   }
-  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  button.danger  { color: var(--danger); }
-  button:disabled { opacity: .5; cursor: default; }
+  button:hover { transform: translate(-1px, -1px); box-shadow: 4px 4px 0 #111; }
+  button.primary {
+    background: var(--accent);
+    border-color: #111;
+    color: #111;
+    text-shadow: 0 0 8px rgba(255, 255, 255, 0.35);
+  }
+  button.danger {
+    color: #111;
+    background: var(--danger);
+  }
+  button:disabled { opacity: .5; cursor: default; transform: none; }
 
-  .toolbar { display: flex; gap: 10px; margin-bottom: 14px; }
+  .toolbar { display: flex; gap: 10px; margin-bottom: 16px; }
   .toolbar input { flex: 1; }
 
-  ul#notes { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
-  li.note { padding: 14px; }
-  li.note h2 { font-size: 16px; margin: 0 0 4px; overflow-wrap: anywhere; }
-  li.note p  { margin: 0 0 10px; color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; }
-  li.note time { font-size: 12px; color: var(--muted); }
-  li.note .actions { display: flex; gap: 8px; justify-content: flex-end; }
+  ul#notes { list-style: none; margin: 0; padding: 0; display: grid; gap: 18px; }
+  li.note { padding: 16px; }
+  li.note:nth-child(3n) { transform: rotate(-0.6deg); outline-color: var(--accent); }
+  li.note:nth-child(3n+1) { transform: rotate(0.5deg); outline-color: var(--accent-2); }
+  li.note:nth-child(3n+2) { transform: rotate(-0.3deg); outline-color: var(--accent-3); }
+  li.note h2 {
+    font-family: "Bangers", sans-serif;
+    font-size: 26px;
+    letter-spacing: 1px;
+    margin: 0 0 6px;
+    overflow-wrap: anywhere;
+    color: #f4e04d;
+    text-shadow: 2px 2px 0 #111;
+  }
+  li.note p  {
+    margin: 0 0 12px;
+    color: var(--muted);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  li.note time { font-size: 12px; color: var(--accent-3); }
+  li.note .actions { display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
   li.note.editing textarea, li.note.editing input { margin-bottom: 10px; }
 
-  #empty { text-align: center; color: var(--muted); padding: 40px 0; }
-  mark { background: var(--accent-soft); color: var(--accent); border-radius: 3px; padding: 0 1px; }
+  #empty {
+    text-align: center;
+    color: var(--accent);
+    padding: 48px 0;
+    font-family: "Rock Salt", cursive;
+    font-size: 18px;
+    text-shadow: 0 0 16px rgba(255, 45, 149, 0.45);
+  }
+  mark {
+    background: var(--accent);
+    color: #111;
+    border-radius: 2px;
+    padding: 0 3px;
+  }
 </style>
 </head>
 <body>
+<span class="spray-tag a">city walls</span>
+<span class="spray-tag b">spray it</span>
+<span class="spray-tag c">we up</span>
 <div class="wrap">
   <header>
     <h1>EasyNotes</h1>

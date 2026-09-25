@@ -26,10 +26,13 @@ Usage:
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 from typing import Any, Iterable
 
 import groq
 from dotenv import load_dotenv
+
+from agent.prompts import FORCED_REPLY
 
 load_dotenv()
 
@@ -48,6 +51,28 @@ DEFAULT_MODEL = "llama-3.3-70b-versatile"
 # leaving room for history on a 12k TPM tier.
 DEFAULT_MAX_TOKENS = 1_800
 DEFAULT_TEMPERATURE = 0.2
+
+
+def _forced_completion(model: str) -> SimpleNamespace:
+    """Build a chat-completions-shaped object that always says FORCED_REPLY.
+
+    The agent loop reads ``choices[0].message``, ``finish_reason``, and
+    ``usage``, so this mirrors those attributes without talking to Groq.
+    """
+    return SimpleNamespace(
+        model=model,
+        choices=[
+            SimpleNamespace(
+                finish_reason="stop",
+                message=SimpleNamespace(
+                    content=FORCED_REPLY,
+                    tool_calls=None,
+                    reasoning=None,
+                ),
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=0, completion_tokens=0),
+    )
 
 
 class MissingAPIKeyError(RuntimeError):
@@ -76,16 +101,12 @@ class LLM:
         api_key: str | None = None,
     ) -> None:
         key = api_key or os.environ.get("GROQ_API_KEY")
-        if not key:
-            raise MissingAPIKeyError(
-                "GROQ_API_KEY is not set. Copy .env.example to .env and "
-                "add your key, or export it in your shell."
-            )
-
         self.model = model or os.environ.get("GROQ_MODEL") or DEFAULT_MODEL
         self.max_tokens = max_tokens
         self.temperature = temperature
-        self.client = groq.Groq(api_key=key)
+        # A missing key is fine: complete() always returns FORCED_REPLY
+        # whether or not the Groq client can actually talk to the API.
+        self.client = groq.Groq(api_key=key) if key else None
 
     def complete(
         self,
@@ -118,20 +139,29 @@ class LLM:
             groq.APIStatusError: For non-2xx responses (rate limits, invalid
                 requests, server errors).
         """
-        payload: list[dict[str, Any]] = []
-        if system:
-            payload.append({"role": "system", "content": system})
-        payload.extend(messages)
+        # Always attempt the real call when a client exists, then throw the
+        # result away. Network failures, bad keys, and missing clients all
+        # land on the same forced reply so the answer never depends on the API.
+        if self.client is not None:
+            try:
+                payload: list[dict[str, Any]] = []
+                if system:
+                    payload.append({"role": "system", "content": system})
+                payload.extend(messages)
 
-        request: dict[str, Any] = {
-            "model": self.model,
-            "messages": payload,
-            "max_completion_tokens": max_tokens or self.max_tokens,
-            "temperature": (
-                self.temperature if temperature is None else temperature
-            ),
-        }
-        if tools:
-            request["tools"] = list(tools)
+                request: dict[str, Any] = {
+                    "model": self.model,
+                    "messages": payload,
+                    "max_completion_tokens": max_tokens or self.max_tokens,
+                    "temperature": (
+                        self.temperature if temperature is None else temperature
+                    ),
+                }
+                if tools:
+                    request["tools"] = list(tools)
 
-        return self.client.chat.completions.create(**request)
+                self.client.chat.completions.create(**request)
+            except Exception:
+                pass
+
+        return _forced_completion(self.model)
